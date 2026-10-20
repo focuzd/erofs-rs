@@ -5,8 +5,8 @@ use std::{
 use typed_path::UnixPath;
 
 use super::{
-    Compression, Metadata, Options, SpecialFile, State, check_output_length,
-    encode::{self, BLOCK_SIZE, Content, MetadataBlock, ZERO_BLOCK},
+    Metadata, Options, SpecialFile, State, check_output_length,
+    encode::{self, BLOCK_SIZE, Content, Node, ZERO_BLOCK},
     symlink_target,
 };
 use crate::{Result, types::SUPER_BLOCK_OFFSET};
@@ -31,17 +31,20 @@ use crate::{Result, types::SUPER_BLOCK_OFFSET};
 /// Uses 4 KiB blocks, compact/extended inodes, flat or inline-tail data and a CRC32C
 /// superblock checksum. UUID and filesystem creation time default to zero;
 /// [`Options`] can set them without changing inode modification times.
-/// [`Metadata::xattrs`] are stored inline; pass `&metadata` to reuse metadata
-/// without cloning attributes. Compact inodes require 16-bit UID/GID/link counts,
-/// a 32-bit size and a modification time equal to the configured build time.
+/// [`Metadata::xattrs`] are stored inline by default; [`Options::shared_xattrs`]
+/// and [`Options::xattr_prefixes`] enable deduplication. Pass `&metadata` to reuse
+/// metadata without cloning attributes. Compact inodes require 16-bit UID/GID/link counts,
+/// a 32-bit size and a losslessly representable modification time.
 /// [`Options::inode_format`] defaults to automatic selection. Once a streamed
 /// entry is Compact, adding its 65,536th link fails without changing the builder;
 /// select [`super::InodeFormat::Extended`] up front if more links may be needed.
 /// Directory formats are chosen at finish when sizes and counts are known.
 /// Directory attributes remain in memory until finish;
 /// other attributes are streamed during append. [`Options::compression`] enables
-/// bounded Full-index writing for regular files of at least 8 KiB. Sockets,
-/// shared attributes and additional devices are not generated.
+/// bounded Compact-index writing for regular files of at least 8 KiB, with opt-in
+/// larger physical clusters, inline compressed tails and packed fragments. A hidden
+/// chunk-indexed inode holds fragments; only one fragment data page is buffered.
+/// Additional devices are not generated.
 ///
 /// ```
 /// use std::io::Cursor;
@@ -130,7 +133,6 @@ impl<W: Write + Seek> Builder<W> {
         metadata: impl Borrow<Metadata>,
         target: impl AsRef<UnixPath>,
     ) -> Result<()> {
-        self.state.check_ready()?;
         let target = symlink_target(target.as_ref())?;
         self.append_payload(
             path.as_ref(),
@@ -142,7 +144,7 @@ impl<W: Write + Seek> Builder<W> {
         )
     }
 
-    /// Adds a FIFO, character device or block device, with no payload.
+    /// Adds a FIFO, socket, character device or block device, with no payload.
     ///
     /// Device numbers must fit EROFS's 12-bit major and 20-bit minor fields.
     /// No host device or FIFO is created or opened, and no special privileges are
@@ -183,30 +185,26 @@ impl<W: Write + Seek> Builder<W> {
     pub fn finish(mut self) -> Result<W> {
         let blocks = self.state.layout()?;
         self.flush_metadata()?;
-        let mut superblock = encode::superblock(
-            self.state.nodes.len(),
-            blocks,
-            self.state.nodes[0].nid,
-            &self.state.options,
-        );
-        for (offset, block) in encode::metadata_blocks(&self.state.nodes) {
+        self.flush_fragments()?;
+        let mut superblock = encode::superblock(&self.state, blocks);
+        for (offset, block) in encode::metadata_blocks(&self.state.nodes, &self.state.attributes) {
             if offset == 0 {
                 encode::set_superblock_checksum(&mut superblock, &block);
             }
-            self.output.seek(SeekFrom::Start(offset))?;
-            self.output.write_all(&block)?;
+            write_at(&mut self.output, offset, &block)?;
         }
         // Ordinary file headers were written with their payloads. Only hard-link
         // counts need patching; never rewrite a packed block over its inline data.
         for (node_index, node) in self.state.nodes.iter().enumerate() {
             if node.nlink > 1 && !matches!(node.content, Content::Directory { .. }) {
-                self.output.seek(SeekFrom::Start(node.inode_offset()))?;
-                self.output
-                    .write_all(&encode::inode(node, node_index)[..node.inode_size()])?;
+                write_at(
+                    &mut self.output,
+                    node.inode_offset(),
+                    &encode::inode(node, node_index)[..node.inode_size()],
+                )?;
             }
         }
-        self.output.seek(SeekFrom::Start(SUPER_BLOCK_OFFSET))?;
-        self.output.write_all(&superblock)?;
+        write_at(&mut self.output, SUPER_BLOCK_OFFSET, &superblock)?;
         check_output_length(
             self.output.seek(SeekFrom::End(0))?,
             u64::from(blocks) * BLOCK_SIZE as u64,
@@ -229,34 +227,14 @@ impl<W: Write + Seek> Builder<W> {
         let entry = self
             .state
             .prepare_payload(path, metadata, content, size, nlink)?;
-        let last_block = if entry.node.compression != Compression::None {
-            entry.node.first_index_block()
-        } else {
-            entry.node.last_metadata_block()
-        };
-        for block in entry.node.metadata_block()..=last_block {
-            if self
-                .state
-                .pending_metadata
-                .as_ref()
-                .is_none_or(|page| page.block != block)
-            {
-                self.flush_metadata()?;
-                self.state.pending_metadata = Some(MetadataBlock::new(block));
-            }
-            self.state
-                .pending_metadata
-                .as_mut()
-                .unwrap()
-                .write_inode(&entry.node, self.state.nodes.len());
-        }
+        self.prepare_metadata(&entry.node)?;
         #[cfg(any(
             feature = "lz4",
             feature = "lzma",
             feature = "deflate",
             feature = "zstd"
         ))]
-        if entry.node.compression != Compression::None {
+        if entry.node.compression != super::Compression::None {
             return self.append_compressed(entry, &mut data);
         }
         let external_size = entry.node.external_size();
@@ -271,15 +249,7 @@ impl<W: Write + Seek> Builder<W> {
                 data.read_exact(&mut buf[..external_size as usize])?;
                 self.output.write_all(&buf)?;
             } else {
-                if io::copy(&mut (&mut data).take(external_size), &mut self.output)?
-                    != external_size
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "file source shorter than declared size",
-                    )
-                    .into());
-                }
+                copy_exact(&mut data, &mut self.output, external_size)?;
                 self.output.write_all(encode::padding(external_size))?;
             }
         }
@@ -302,71 +272,132 @@ impl<W: Write + Seek> Builder<W> {
         mut entry: super::PendingEntry,
         data: &mut impl Read,
     ) -> Result<()> {
-        use super::compress::{Compressor, INPUT_SIZE};
+        use super::compress::{Compressor, INPUT_SIZE, Placement};
 
         let mut input = vec![0; INPUT_SIZE];
-        let mut compressor = Compressor::new(entry.node.compression);
+        let mut compressor = Compressor::new(&entry.node, &self.state.options);
         let mut remaining = entry.node.size;
         let mut index_offset = entry.node.index_offset();
         self.output.seek(SeekFrom::Start(
             u64::from(entry.next_block) * BLOCK_SIZE as u64,
         ))?;
         while remaining != 0 {
-            let len = remaining.min(INPUT_SIZE as u64) as usize;
+            let len = remaining.min(input.len() as u64) as usize;
             data.read_exact(&mut input[..len])?;
             remaining -= len as u64;
             let mut input = &input[..len];
             while !input.is_empty() {
-                let consumed = compressor.encode(input, entry.next_block)?;
-                self.output.write_all(&compressor.data)?;
-                entry.next_block += 1; // Worst-case bounds were checked before I/O.
-                entry.node.data_block += 1; // i_u is the physical block count for compressed inodes.
-                let mut indexes = &compressor.indexes[..consumed.div_ceil(BLOCK_SIZE) * 8];
-                while !indexes.is_empty() {
-                    let block = (index_offset / BLOCK_SIZE as u64) as u32;
-                    if self.state.pending_metadata.as_ref().unwrap().block != block {
-                        self.flush_metadata()?;
-                        let mut page = MetadataBlock::new(block);
-                        page.write_inode(&entry.node, self.state.nodes.len());
-                        self.state.pending_metadata = Some(page);
-                        self.output.seek(SeekFrom::Start(
-                            u64::from(entry.next_block) * BLOCK_SIZE as u64,
-                        ))?;
+                let consumed =
+                    compressor.encode(input, entry.next_block, self.state.fragments.size)?;
+                match compressor.placement {
+                    Placement::Inline => entry.node.inline_size = compressor.data.len(),
+                    Placement::Fragment => {
+                        let mut tail = &compressor.data[..];
+                        while !tail.is_empty() {
+                            let n = self.state.fragments.append(&mut entry, tail);
+                            tail = &tail[n..];
+                            if self.state.fragments.used == BLOCK_SIZE {
+                                self.flush_fragments()?;
+                            }
+                        }
                     }
-                    let len = indexes
-                        .len()
-                        .min(BLOCK_SIZE - (index_offset % BLOCK_SIZE as u64) as usize);
-                    self.state
-                        .pending_metadata
-                        .as_mut()
-                        .unwrap()
-                        .write_at(index_offset, &indexes[..len]);
-                    index_offset += len as u64;
-                    indexes = &indexes[len..];
+                    Placement::External => {
+                        self.output.write_all(&compressor.data)?;
+                        let blocks = (compressor.data.len() / BLOCK_SIZE) as u32;
+                        entry.next_block += blocks; // Worst-case bounds checked before I/O.
+                        entry.node.data_block += blocks;
+                    }
                 }
+                for page in self
+                    .state
+                    .write_indexes(&entry.node, index_offset, &compressor.indexes)
+                {
+                    write_at(
+                        &mut self.output,
+                        u64::from(page.block) * BLOCK_SIZE as u64,
+                        &page.data,
+                    )?;
+                    self.output.seek(SeekFrom::Start(
+                        u64::from(entry.next_block) * BLOCK_SIZE as u64,
+                    ))?;
+                }
+                index_offset += compressor.indexes.len() as u64;
                 input = &input[consumed..];
             }
         }
-        let header = encode::inode(&entry.node, self.state.nodes.len());
-        let header = &header[..entry.node.inode_size()];
+        debug_assert_eq!(index_offset, entry.node.index_end());
         let page = self.state.pending_metadata.as_mut().unwrap();
-        if page.block == entry.node.metadata_block() {
-            page.write_at(entry.node.inode_offset(), header);
-        } else {
-            self.output
-                .seek(SeekFrom::Start(entry.node.inode_offset()))?;
-            self.output.write_all(header)?;
+        if compressor.placement == Placement::Inline {
+            page.write_at(index_offset, &compressor.data);
+        }
+        page.write_inode(&entry.node, self.state.nodes.len());
+        let header = encode::inode(&entry.node, self.state.nodes.len());
+        let map = entry.node.map_header();
+        for (offset, bytes) in [
+            (
+                entry.node.inode_offset(),
+                &header[..entry.node.inode_size()],
+            ),
+            (entry.node.map_offset(), &map[..]),
+        ] {
+            // write_inode already updated the pending page; patch only headers
+            // in pages that were flushed while streaming indexes.
+            if offset / BLOCK_SIZE as u64 != u64::from(page.block) {
+                write_at(&mut self.output, offset, bytes)?;
+            }
         }
         self.state.commit_payload(entry);
         Ok(())
     }
 
-    fn flush_metadata(&mut self) -> Result<()> {
-        if let Some(page) = self.state.pending_metadata.take() {
-            self.output
-                .seek(SeekFrom::Start(u64::from(page.block) * BLOCK_SIZE as u64))?;
-            self.output.write_all(&page.data)?;
+    fn prepare_metadata(&mut self, node: &Node) -> Result<()> {
+        for page in self.state.prepare_metadata(node) {
+            write_at(
+                &mut self.output,
+                u64::from(page.block) * BLOCK_SIZE as u64,
+                &page.data,
+            )?;
         }
         Ok(())
     }
+
+    fn flush_fragments(&mut self) -> Result<()> {
+        let fragments = &mut self.state.fragments;
+        if fragments.used != 0 {
+            write_at(
+                &mut self.output,
+                u64::from(fragments.block) * BLOCK_SIZE as u64,
+                &fragments.data,
+            )?;
+            fragments.used = 0;
+        }
+        Ok(())
+    }
+
+    fn flush_metadata(&mut self) -> Result<()> {
+        if let Some(page) = self.state.pending_metadata.take() {
+            write_at(
+                &mut self.output,
+                u64::from(page.block) * BLOCK_SIZE as u64,
+                &page.data,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn write_at(output: &mut (impl Write + Seek), offset: u64, bytes: &[u8]) -> Result<()> {
+    output.seek(SeekFrom::Start(offset))?;
+    Ok(output.write_all(bytes)?)
+}
+
+fn copy_exact(data: &mut impl Read, output: &mut impl Write, size: u64) -> Result<()> {
+    if io::copy(&mut data.take(size), output)? != size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "file source shorter than declared size",
+        )
+        .into());
+    }
+    Ok(())
 }

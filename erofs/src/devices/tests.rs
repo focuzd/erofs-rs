@@ -281,6 +281,173 @@ fn full_device_id_width_and_zero_unified_addresses() {
 }
 
 #[test]
+fn chunk_maps_share_data_and_cross_index_pages() {
+    for format in [0u16, 0x20, 0x60] {
+        let [mut data, blob, _] = fixture();
+        data.resize(27 * 512, 0);
+        data[1060] = 27;
+        data[1104] |= 4 | 0x80;
+        data[1110] = 1;
+        (&mut data[1348..]).put_u32_le(64); // Device mapping outside primary data.
+        (&mut data[2096..]).put_u32_le(24); // Move the directory past the index pages.
+        directory(
+            &mut data[24 * 512..25 * 512],
+            &[
+                (1, b".", 2),
+                (1, b"..", 2),
+                (2, b"a", 1),
+                (2, b"alias", 1),
+                (0, b"empty", 1),
+            ],
+        );
+        data[2048] = 8; // Empty chunk-based inode, nid 0.
+        (&mut data[2052..]).put_u16_le(0o100644);
+        data[2114..2116].fill(0); // No xattrs.
+        let size = 1030 * 1024 + 3;
+        (&mut data[2120..]).put_u32_le(size as u32);
+        (&mut data[2128..]).put_u32_le(u32::from(format) | 1);
+        let entry_size = if format == 0 { 4 } else { 8 };
+        let null = if format == 0x60 {
+            (1u64 << 48) - 1
+        } else {
+            u64::from(u32::MAX)
+        };
+        for (i, mut record) in data[2144..2144 + 1031 * entry_size]
+            .chunks_exact_mut(entry_size)
+            .enumerate()
+        {
+            let (device, block) = match i {
+                0 | 3 => (0, 25),
+                2 if format == 0 => (0, 64),
+                2 => (1, 0),
+                _ => (0, null),
+            };
+            if format != 0 {
+                record.put_u16_le((block >> 32) as u16);
+                record.put_u16_le(device);
+            }
+            record.put_u32_le(block as u32);
+        }
+        data[25 * 512..].fill(0x31);
+        let sources = [&data, &blob].map(|data| Source {
+            data: SliceImage::new(data),
+            reads: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let fs = EroFS::new_with_devices(&sources[0], vec![&sources[1]]).unwrap();
+        let afs = ready(crate::r#async::EroFS::new_with_devices(
+            &sources[0],
+            vec![&sources[1]],
+        ))
+        .unwrap();
+        let mut expected = vec![0; size];
+        expected[..1024].fill(0x31);
+        expected[2048..3072].copy_from_slice(&blob[..1024]);
+        expected[3072..4096].fill(0x31);
+        for path in ["a", "alias"] {
+            crate::tests::check_read_at(
+                &fs.open(path).unwrap(),
+                &ready(afs.open(path)).unwrap(),
+                &expected,
+            );
+        }
+        let mut buf = [1];
+        assert_eq!(fs.open("empty").unwrap().read(&mut buf).unwrap(), 0);
+        assert_eq!(
+            ready(ready(afs.open("empty")).unwrap().read(&mut buf)).unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn wide_chunk_addresses_reach_devices_without_host_sized_offsets() {
+    use crate::backend::{AsyncImage, Image};
+    use core::ops::{Bound, RangeBounds};
+
+    struct Window<'a> {
+        data: &'a [u8],
+        start: u64,
+    }
+
+    impl Image for &Window<'_> {
+        fn len(&self) -> u64 {
+            self.start + self.data.len() as u64
+        }
+
+        fn get<R: RangeBounds<u64>>(&self, range: R) -> Option<&[u8]> {
+            let start = match range.start_bound() {
+                Bound::Included(&n) => n,
+                Bound::Excluded(&n) => n.checked_add(1)?,
+                Bound::Unbounded => 0,
+            };
+            let end = match range.end_bound() {
+                Bound::Excluded(&n) => n,
+                Bound::Included(&n) => n.checked_add(1)?,
+                Bound::Unbounded => self.len(),
+            };
+            self.data.get(
+                usize::try_from(start.checked_sub(self.start)?).ok()?
+                    ..usize::try_from(end.checked_sub(self.start)?).ok()?,
+            )
+        }
+    }
+
+    impl AsyncImage for &Window<'_> {
+        async fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+            if !buf.is_empty() {
+                buf.copy_from_slice(
+                    self.get(offset..offset + buf.len() as u64)
+                        .ok_or_else(|| Error::OutOfBounds("test window".into()))?,
+                );
+            }
+            Ok(())
+        }
+    }
+
+    let block = (1u64 << 32) + 7;
+    let blob = [0x59; 8192];
+    // A 48-bit device/chunk fixture, independent of the public image builder.
+    let [mut image, _, _] = fixture();
+    image[1104] |= 0x80;
+    image[1110] = 1;
+    (&mut image[1344..]).put_u32_le((block + 16) as u32);
+    (&mut image[1352..]).put_u16_le(((block + 16) >> 32) as u16);
+    image[1348..1352].fill(0); // No unified mapping.
+    image[2114..2116].fill(0); // No xattrs.
+    (&mut image[2120..]).put_u32_le(blob.len() as u32);
+    (&mut image[2128..]).put_u32_le(0x64); // 8 KiB chunks on a 512-byte filesystem.
+    let mut index = &mut image[2144..2152];
+    index.put_u16_le((block >> 32) as u16);
+    index.put_u16_le(1);
+    index.put_u32_le(block as u32);
+    let sources = [
+        Window {
+            data: &image,
+            start: 0,
+        },
+        Window {
+            data: &blob,
+            start: block * 512,
+        },
+    ];
+    let fs = crate::EroFS::new_with_devices(&sources[0], vec![&sources[1]]).unwrap();
+    let afs = ready(crate::r#async::EroFS::new_with_devices(
+        &sources[0],
+        vec![&sources[1]],
+    ))
+    .unwrap();
+    let file = fs.open("a").unwrap();
+    crate::tests::check_read_at(&file, &ready(afs.open("a")).unwrap(), &blob);
+    let mut data = [0; 8192];
+    let mut file = file;
+    for chunk in data.chunks_mut(512) {
+        assert_eq!(file.read(chunk).unwrap(), chunk.len());
+    }
+    assert_eq!(data, blob);
+}
+
+#[test]
 fn wide_chunks_holes_and_device_ranges_use_u64() {
     let [mut data, _, _] = fixture();
     data[1104] |= 0x80;

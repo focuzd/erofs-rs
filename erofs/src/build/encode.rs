@@ -1,9 +1,9 @@
-use alloc::{format, string::String, vec::Vec};
-use bytes::BufMut;
+use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
+use bytes::{Buf, BufMut};
 use crc32c::{crc32c, crc32c_append};
 use std::io;
 
-use super::{Compression, InodeFormat, Metadata, Options, SpecialFile};
+use super::{Compression, InodeFormat, Metadata, Options, SpecialFile, State};
 use crate::{
     Error, Result, Xattrs,
     types::{
@@ -20,7 +20,20 @@ pub(super) const ZERO_BLOCK: [u8; BLOCK_SIZE] = [0; BLOCK_SIZE];
 pub(super) const ROOT_OFFSET: usize = SUPER_BLOCK_OFFSET as usize + SuperBlock::size();
 pub(super) const MAX_XATTR_SIZE: usize = size_of::<XattrHeader>() + (u16::MAX as usize - 1) * 4;
 
-fn xattr_name(name: &[u8]) -> Result<(u8, &[u8])> {
+const ADVISE_COMPACTED_2B: u16 = 1;
+const ADVISE_BIG_PCLUSTER: u16 = 2 | 4; // Both HEAD types must agree for Compact indexes.
+const ADVISE_INLINE_TAIL: u16 = 8;
+const ADVISE_FRAGMENT: u16 = 0x20;
+
+const FEATURE_ZERO_PADDING: u32 = 1;
+const FEATURE_COMPRESSION_CONFIG: u32 = 2;
+const FEATURE_CHUNKED_FILE: u32 = 4;
+const FEATURE_INLINE_TAILS: u32 = 0x10;
+const FEATURE_FRAGMENTS: u32 = 0x20;
+const FEATURE_XATTR_PREFIXES: u32 = 0x40;
+const FEATURE_48BIT: u32 = 0x80;
+
+pub(super) fn xattr_name(name: &[u8]) -> Result<(u8, &[u8])> {
     if name.is_empty() || name.len() > 255 || name.contains(&0) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid xattr name").into());
     }
@@ -40,44 +53,175 @@ fn xattr_name(name: &[u8]) -> Result<(u8, &[u8])> {
     )))
 }
 
-pub(super) fn xattr_entry_size(name: &[u8], value_len: usize) -> Result<usize> {
-    let (_, suffix) = xattr_name(name)?;
+pub(super) fn xattr_entry_size(name_len: usize, value_len: usize) -> Result<usize> {
     if value_len > u16::MAX as usize {
         return Err(Error::Overflow("xattr value size"));
     }
-    Ok((size_of::<XattrEntry>() + suffix.len() + value_len).next_multiple_of(4))
-}
-
-fn xattr_size(attrs: &Xattrs) -> Result<usize> {
-    if attrs.is_empty() {
-        return Ok(0);
-    }
-    let mut size = size_of::<XattrHeader>();
-    for (name, value) in attrs {
-        size += xattr_entry_size(name, value.len())?;
-        if size > MAX_XATTR_SIZE {
-            return Err(Error::Overflow("inode xattr size"));
-        }
-    }
-    Ok(size)
+    Ok((size_of::<XattrEntry>() + name_len + value_len).next_multiple_of(4))
 }
 
 fn xattrs(attrs: &Xattrs) -> Result<Vec<u8>> {
-    let size = xattr_size(attrs)?;
-    let mut data = Vec::new();
-    data.try_reserve_exact(size)
-        .map_err(|_| Error::OutOfBounds("cannot allocate inode xattrs".into()))?;
-    data.resize(size.min(size_of::<XattrHeader>()), 0); // No filter, shared IDs or extensions.
+    if attrs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut data = vec![0; size_of::<XattrHeader>()];
     for (name, value) in attrs {
         let (index, suffix) = xattr_name(name)?;
+        let size = data.len() + xattr_entry_size(suffix.len(), value.len())?;
+        if size > MAX_XATTR_SIZE {
+            return Err(Error::Overflow("inode xattr size"));
+        }
         data.put_u8(suffix.len() as u8);
         data.put_u8(index);
         data.put_u16_le(value.len() as u16);
         data.put_slice(suffix);
         data.put_slice(value);
-        data.resize(data.len().next_multiple_of(4), 0);
+        data.resize(size, 0);
     }
     Ok(data)
+}
+
+#[derive(Default)]
+pub(super) struct Attributes {
+    records: BTreeMap<Vec<u8>, u32>,
+    bytes: usize,
+    pub prefixes: Vec<Vec<u8>>,
+    pub prefix_start: u32,
+    table_block: u32,
+    pub table: Vec<u8>,
+}
+
+impl Attributes {
+    pub fn rewrite(&mut self, node: &mut Node, options: &Options) {
+        if node.xattrs.is_empty() || (!options.shared_xattrs && !options.xattr_prefixes) {
+            return;
+        }
+        let mut shared = Vec::new();
+        let mut inline = Vec::new();
+        let mut entries = &node.xattrs[size_of::<XattrHeader>()..];
+        while !entries.is_empty() {
+            let name_len = usize::from(entries[0]);
+            let value_len = usize::from((&entries[2..]).get_u16_le());
+            let len = (4 + name_len + value_len).next_multiple_of(4);
+            let mut record = entries[..len].to_vec();
+            let name = &entries[4..4 + name_len];
+            if options.xattr_prefixes && !matches!(entries[1], 0 | 2 | 3) {
+                let id = self
+                    .prefixes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p[0] == entries[1] && name.starts_with(&p[1..]))
+                    .max_by_key(|(_, p)| p.len())
+                    .map(|(id, _)| id)
+                    .or_else(|| {
+                        if self.prefixes.len() == 128 {
+                            return None;
+                        }
+                        // ponytail: automatic selection uses the last dot/full suffix;
+                        // a global prescan can choose better prefixes if needed.
+                        let len = name
+                            .iter()
+                            .rposition(|&b| b == b'.')
+                            .map_or(name.len(), |i| i + 1);
+                        if len < 8 {
+                            return None;
+                        }
+                        self.prefixes.push([&entries[1..2], &name[..len]].concat());
+                        Some(self.prefixes.len() - 1)
+                    });
+                if let Some(id) = id {
+                    let prefix_len = self.prefixes[id].len() - 1;
+                    record.clear();
+                    record.put_u8((name_len - prefix_len) as u8);
+                    record.put_u8(0x80 | id as u8);
+                    record.put_u16_le(value_len as u16);
+                    record.extend_from_slice(&entries[4 + prefix_len..4 + name_len + value_len]);
+                    record.resize(record.len().next_multiple_of(4), 0);
+                }
+            }
+            if options.shared_xattrs
+                && shared.len() < u8::MAX as usize
+                && let Some(&id) = self.records.get(&record)
+            {
+                shared.push(id);
+            } else {
+                inline.extend_from_slice(&record);
+            }
+            entries = &entries[len..];
+        }
+        node.xattrs = vec![0; size_of::<XattrHeader>()];
+        node.xattrs[4] = shared.len() as u8;
+        for id in shared {
+            node.xattrs.put_u32_le(id);
+        }
+        node.xattrs.extend_from_slice(&inline);
+        node.xattr_size = node.xattrs.len();
+    }
+
+    pub fn remember(&mut self, node: &Node, options: &Options) {
+        if !options.shared_xattrs || node.xattrs.is_empty() {
+            return;
+        }
+        let start = size_of::<XattrHeader>() + usize::from(node.xattrs[4]) * 4;
+        let mut offset = node.inode_offset() + node.inode_size() as u64 + start as u64;
+        let mut entries = &node.xattrs[start..];
+        while !entries.is_empty() {
+            let len = (4 + usize::from(entries[0]) + usize::from((&entries[2..]).get_u16_le()))
+                .next_multiple_of(4);
+            // Shared records have exactly the inline entry encoding. Reference the
+            // original stored entry, rather than writing a second attribute table.
+            // ponytail: exact cache capped at 256 KiB / 4096 entries and 32-bit IDs;
+            // unmatched records stay inline. Add an external index only if needed.
+            if len > 4
+                && self.bytes + len <= 256 * 1024
+                && self.records.len() < 4096
+                && let Ok(id) = u32::try_from(offset / 4)
+                && !self.records.contains_key(&entries[..len])
+            {
+                self.records.insert(entries[..len].to_vec(), id);
+                self.bytes += len;
+            }
+            entries = &entries[len..];
+            offset += len as u64;
+        }
+    }
+
+    pub fn allocate_prefixes(&mut self, next_block: &mut u32, packed_size: u64) -> Result<()> {
+        if self.prefixes.is_empty() {
+            return Ok(());
+        }
+        self.table_block = *next_block;
+        // Older kernels always read prefixes through the packed inode when it
+        // exists. Append whole table pages to its logical chunk map, not its buffer.
+        let offset = if packed_size != 0 {
+            packed_size.next_multiple_of(BLOCK_SIZE as u64)
+        } else {
+            u64::from(*next_block) * BLOCK_SIZE as u64
+        };
+        // ponytail: without a packed inode, the table must start below 16 GiB.
+        self.prefix_start =
+            u32::try_from(offset / 4).map_err(|_| Error::Overflow("xattr prefix address"))?;
+        for prefix in &self.prefixes {
+            self.table.put_u16_le(prefix.len() as u16);
+            self.table.extend_from_slice(prefix);
+            self.table.resize(self.table.len().next_multiple_of(4), 0);
+        }
+        *next_block = next_block
+            .checked_add(self.table.len().div_ceil(BLOCK_SIZE) as u32)
+            .ok_or(Error::Overflow("xattr prefix blocks"))?;
+        Ok(())
+    }
+
+    pub fn blocks(&self) -> impl Iterator<Item = (u64, [u8; BLOCK_SIZE])> {
+        self.table.chunks(BLOCK_SIZE).enumerate().map(|(i, bytes)| {
+            let mut block = ZERO_BLOCK;
+            block[..bytes.len()].copy_from_slice(bytes);
+            (
+                (u64::from(self.table_block) + i as u64) * BLOCK_SIZE as u64,
+                block,
+            )
+        })
+    }
 }
 
 pub(super) struct MetadataBlock {
@@ -107,13 +251,8 @@ impl MetadataBlock {
             &inode(node, node_index)[..node.inode_size()],
         );
         self.write_at(node.inode_offset() + node.inode_size() as u64, &node.xattrs);
-        if let Some(algorithm) = node.compression.algorithm() {
-            let mut header = [0; 16];
-            let mut fields = &mut header[..];
-            fields.put_bytes(0, 6); // No inline data or advice.
-            fields.put_u8(algorithm); // HEAD1 codec; HEAD2 is unused.
-            fields.put_u8(0); // 4 KiB logical clusters.
-            self.write_at(node.index_offset() - 16, &header);
+        if node.compression != Compression::None {
+            self.write_at(node.map_offset(), &node.map_header());
         }
         let end = node.metadata_end();
         self.used = ((end - u64::from(self.block) * BLOCK_SIZE as u64).min(BLOCK_SIZE as u64)
@@ -138,6 +277,7 @@ pub(super) struct Entry {
 
 pub(super) enum Content {
     File,
+    Packed,
     Directory { parent: usize, entries: Vec<Entry> },
     Symlink,
     Special(SpecialFile),
@@ -146,10 +286,11 @@ pub(super) enum Content {
 impl Content {
     pub fn file_type(&self) -> DirentFileType {
         match self {
-            Self::File => DirentFileType::RegularFile,
+            Self::File | Self::Packed => DirentFileType::RegularFile,
             Self::Directory { .. } => DirentFileType::Directory,
             Self::Symlink => DirentFileType::Symlink,
             Self::Special(SpecialFile::Fifo) => DirentFileType::Fifo,
+            Self::Special(SpecialFile::Socket) => DirentFileType::Socket,
             Self::Special(SpecialFile::CharacterDevice { .. }) => DirentFileType::CharacterDevice,
             Self::Special(SpecialFile::BlockDevice { .. }) => DirentFileType::BlockDevice,
         }
@@ -171,6 +312,10 @@ pub(super) struct Node {
     pub inline_size: usize,
     pub compact: bool,
     pub compression: Compression,
+    pub big_pcluster: bool,
+    pub fragment_offset: Option<u64>,
+    // At most one new packed data block is allocated by a <=4 KiB fragment.
+    pub fragment_block: Option<u32>,
     pub xattr_size: usize,
     // Only directory attributes survive an append; file attributes are streamed.
     pub xattrs: Vec<u8>,
@@ -204,23 +349,21 @@ impl Node {
             inline_size: 0,
             compact: false,
             compression: Compression::None,
+            big_pcluster: false,
+            fragment_offset: None,
+            fragment_block: None,
             xattr_size: xattrs.len(),
             xattrs,
         })
     }
 
-    pub fn can_compact(&self, options: &Options, nlink: u32) -> bool {
-        self.size <= u64::from(u32::MAX)
+    pub fn select_format(&mut self, options: &Options, nlink: u32) -> Result<()> {
+        let fits = self.size <= u64::from(u32::MAX)
             && self.metadata.uid <= u32::from(u16::MAX)
             && self.metadata.gid <= u32::from(u16::MAX)
             && nlink <= u32::from(u16::MAX)
-            // Legacy readers inherit the whole timestamp. Nonzero compact
-            // mtime deltas would require the newer 48-bit addressing feature.
-            && self.metadata.modified == options.build_time
-    }
-
-    pub fn select_format(&mut self, options: &Options, nlink: u32) -> Result<()> {
-        let fits = self.can_compact(options, nlink);
+            // Legacy Compact inodes inherit the complete superblock timestamp.
+            && self.metadata.modified == options.build_time;
         if options.inode_format == InodeFormat::Compact && !fits {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -252,13 +395,56 @@ impl Node {
         self.inode_offset() + self.inode_size() as u64 + self.xattr_size as u64
     }
 
+    pub fn map_offset(&self) -> u64 {
+        self.inline_offset().next_multiple_of(8)
+    }
+
     pub fn index_offset(&self) -> u64 {
-        self.inline_offset().next_multiple_of(8) + 16
+        self.map_offset() + 8
+    }
+
+    /// Logical indexes in 16-entry, 32-byte packs. Leading/trailing indexes use
+    /// two-entry, 8-byte packs. NIDs are 32-byte aligned, so placement preserves this.
+    pub fn two_byte_indexes(&self) -> core::ops::Range<u64> {
+        let count = self.size.div_ceil(BLOCK_SIZE as u64);
+        let initial = (((32 - self.index_offset() % 32) / 4) & 7).min(count);
+        initial..initial + (count - initial) / 16 * 16
+    }
+
+    pub fn index_end(&self) -> u64 {
+        let middle = self.two_byte_indexes();
+        let bytes = self.size.div_ceil(BLOCK_SIZE as u64) * 4 - (middle.end - middle.start) * 2;
+        self.index_offset() + bytes.next_multiple_of(8)
+    }
+
+    pub fn map_header(&self) -> [u8; 8] {
+        let mut header = [0; 8];
+        let mut fields = &mut header[..];
+        fields.put_u32_le(
+            self.fragment_offset
+                .map_or((self.inline_size as u32) << 16, |offset| offset as u32),
+        );
+        let mut advise = ADVISE_COMPACTED_2B;
+        if self.big_pcluster {
+            advise |= ADVISE_BIG_PCLUSTER;
+        }
+        if self.inline_size != 0 {
+            advise |= ADVISE_INLINE_TAIL;
+        }
+        if self.fragment_offset.is_some() {
+            advise |= ADVISE_FRAGMENT;
+        }
+        fields.put_u16_le(advise);
+        fields.put_u8(self.compression.algorithm().unwrap());
+        fields.put_u8(0);
+        header
     }
 
     pub fn metadata_end(&self) -> u64 {
-        if self.compression != Compression::None {
-            self.index_offset() + self.size.div_ceil(BLOCK_SIZE as u64) * 8
+        if matches!(self.content, Content::Packed) {
+            self.inline_offset() + self.size.div_ceil(BLOCK_SIZE as u64) * 4
+        } else if self.compression != Compression::None {
+            self.index_end() + self.inline_size as u64
         } else {
             self.inline_offset() + self.inline_size as u64
         }
@@ -268,12 +454,22 @@ impl Node {
         ((self.metadata_end() - 1) / BLOCK_SIZE as u64) as u32
     }
 
-    pub fn first_index_block(&self) -> u32 {
-        (self.index_offset() / BLOCK_SIZE as u64) as u32
+    /// Write headers/attributes now; indexes and inline data follow incrementally.
+    pub fn header_blocks(&self) -> core::ops::RangeInclusive<u32> {
+        let last = if self.compression != Compression::None {
+            (self.index_offset() / BLOCK_SIZE as u64) as u32
+        } else {
+            self.last_metadata_block()
+        };
+        self.metadata_block()..=last
     }
 
     pub fn external_size(&self) -> u64 {
-        self.size - self.inline_size as u64
+        if self.compression == Compression::None {
+            self.size - self.inline_size as u64
+        } else {
+            self.size
+        }
     }
 }
 
@@ -333,10 +529,11 @@ fn directory_block(entries: &[Entry], nodes: &[Node]) -> [u8; BLOCK_SIZE] {
 
 pub(super) fn inode(node: &Node, node_index: usize) -> [u8; InodeExtended::size()] {
     let kind = match node.content {
-        Content::File => FileMode::IRREGULAR,
+        Content::File | Content::Packed => FileMode::IRREGULAR,
         Content::Directory { .. } => FileMode::DIR,
         Content::Symlink => FileMode::SYMLINK,
         Content::Special(SpecialFile::Fifo) => FileMode::NAMED_PIPE,
+        Content::Special(SpecialFile::Socket) => FileMode::SOCKET,
         Content::Special(SpecialFile::CharacterDevice { .. }) => FileMode::CHAR_DEVICE,
         Content::Special(SpecialFile::BlockDevice { .. }) => FileMode::BLOCK_DEVICE,
     };
@@ -347,8 +544,10 @@ pub(super) fn inode(node: &Node, node_index: usize) -> [u8; InodeExtended::size(
         ) => (major << 8) | (minor & 0xff) | ((minor & 0xfff00) << 12),
         _ => node.data_block,
     };
-    let layout = if node.compression != Compression::None {
-        Layout::CompressedFull
+    let layout = if matches!(node.content, Content::Packed) {
+        Layout::ChunkBased
+    } else if node.compression != Compression::None {
+        Layout::CompressedCompact
     } else if node.inline_size == 0 {
         Layout::FlatPlain
     } else {
@@ -366,7 +565,7 @@ pub(super) fn inode(node: &Node, node_index: usize) -> [u8; InodeExtended::size(
     if node.compact {
         fields.put_u16_le(node.nlink as u16);
         fields.put_u32_le(node.size as u32);
-        fields.put_u32_le(0); // mtime delta; the complete timestamp equals the superblock's.
+        fields.put_u32_le(0); // No modification-time delta.
         fields.put_u32_le(inode_data);
         fields.put_u32_le(node_index as u32 + 1);
         fields.put_u16_le(node.metadata.uid as u16);
@@ -387,8 +586,44 @@ pub(super) fn inode(node: &Node, node_index: usize) -> [u8; InodeExtended::size(
 
 // Directory records are allocated after payloads, starting in the superblock's
 // unused space. File records have already been streamed in packed metadata blocks.
-pub(super) fn metadata_blocks(nodes: &[Node]) -> impl Iterator<Item = (u64, [u8; BLOCK_SIZE])> {
-    directory_data_blocks(nodes).chain(directory_inode_blocks(nodes))
+pub(super) fn metadata_blocks(
+    nodes: &[Node],
+    attributes: &Attributes,
+) -> impl Iterator<Item = (u64, [u8; BLOCK_SIZE])> {
+    directory_data_blocks(nodes)
+        .chain(directory_inode_blocks(nodes))
+        .chain(packed_inode_blocks(nodes, attributes))
+        .chain(attributes.blocks())
+}
+
+fn packed_inode_blocks(
+    nodes: &[Node],
+    attributes: &Attributes,
+) -> impl Iterator<Item = (u64, [u8; BLOCK_SIZE])> {
+    nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| matches!(n.content, Content::Packed))
+        .flat_map(move |(index, node)| {
+            // Addresses come from existing per-file metadata; no packed index or
+            // fragment payload grows in memory with the file/image size.
+            let mut blocks = nodes.iter().filter_map(|n| n.fragment_block).chain(
+                attributes.table_block
+                    ..attributes.table_block + attributes.table.len().div_ceil(BLOCK_SIZE) as u32,
+            );
+            (node.metadata_block()..=node.last_metadata_block()).map(move |block| {
+                let mut page = MetadataBlock::new(block);
+                page.write_inode(node, index);
+                let base = u64::from(block) * BLOCK_SIZE as u64;
+                for at in (node.inline_offset().max(base)
+                    ..node.metadata_end().min(base + BLOCK_SIZE as u64))
+                    .step_by(4)
+                {
+                    page.write_at(at, &blocks.next().unwrap().to_le_bytes());
+                }
+                (base, page.data)
+            })
+        })
 }
 
 fn directory_data_blocks(nodes: &[Node]) -> impl Iterator<Item = (u64, [u8; BLOCK_SIZE])> {
@@ -450,7 +685,10 @@ pub(super) fn padding(size: u64) -> &'static [u8] {
     &ZERO_BLOCK[..padding as usize]
 }
 
-pub(super) fn superblock(inodes: usize, blocks: u32, root_nid: u64, options: &Options) -> Vec<u8> {
+pub(super) fn superblock(state: &State, blocks: u32) -> Vec<u8> {
+    let options = &state.options;
+    let inodes = state.nodes.len();
+    let root_nid = state.nodes[0].nid;
     let mut superblock = vec![0; SuperBlock::size()];
     let mut fields = &mut superblock[..];
     fields.put_u32_le(MAGIC_NUMBER);
@@ -467,23 +705,60 @@ pub(super) fn superblock(inodes: usize, blocks: u32, root_nid: u64, options: &Op
     fields.put_u32_le(options.build_time.1);
     fields.put_u32_le(blocks);
     fields.put_u32_le(0); // NIDs are relative to the start of the image.
-    fields.put_u32_le(0); // No shared xattrs.
+    fields.put_u32_le(0); // Shared IDs address original inline records from byte zero.
     fields.put_slice(&options.uuid);
-    fields.put_bytes(0, 16); // volume_name.
+    fields.put_bytes(0, 16); // No volume label.
     let compression = options.compression;
-    let flags = u32::from(compression != Compression::None)
-        | if compression.config_size() != 0 { 2 } else { 0 };
-    fields.put_u32_le(flags | if wide_root { 0x80 } else { 0 }); // 0PADDING / COMPR_CFGS / 48-bit.
+    let packed_nid = state
+        .nodes
+        .iter()
+        .find(|n| matches!(n.content, Content::Packed))
+        .map_or(0, |n| n.nid);
+    let mut features = 0;
+    if compression != Compression::None {
+        features |= FEATURE_ZERO_PADDING;
+    }
+    if options.config_size() != 0 {
+        features |= FEATURE_COMPRESSION_CONFIG;
+    }
+    if packed_nid != 0 {
+        features |= FEATURE_CHUNKED_FILE | FEATURE_FRAGMENTS;
+    }
+    if !state.attributes.table.is_empty() {
+        features |= FEATURE_XATTR_PREFIXES;
+    }
+    if state
+        .nodes
+        .iter()
+        .any(|n| n.compression != Compression::None && n.inline_size != 0)
+    {
+        features |= FEATURE_INLINE_TAILS;
+    }
+    if wide_root {
+        features |= FEATURE_48BIT;
+    }
+    fields.put_u32_le(features);
     fields.put_u16_le(match compression {
         Compression::None => 0,
-        Compression::Lz4 => u16::MAX, // Legacy LZ4 maximum match distance; no config record.
+        Compression::Lz4 if options.config_size() == 0 => u16::MAX, // Legacy maximum distance.
         _ => 1 << compression.algorithm().unwrap(),
     });
-    fields.put_bytes(0, 26); // Unused layout fields and the zero build-time delta.
+    fields.put_u32_le(0); // No additional devices or device table.
+    fields.put_u8(0); // No directory block override.
+    fields.put_u8(state.attributes.prefixes.len() as u8);
+    fields.put_u32_le(state.attributes.prefix_start);
+    fields.put_u64_le(packed_nid);
+    fields.put_bytes(0, 8); // Xattr filter fields and zero build-time delta.
     fields.put_u64_le(if wide_root { root_nid } else { 0 }); // root_nid_wide.
     // Global codec configuration follows the base superblock. It is written with
     // the final header and included in its CRC, even when all root metadata moved.
     match compression {
+        Compression::Lz4 if options.config_size() != 0 => {
+            superblock.put_u16_le(14);
+            superblock.put_u16_le(u16::MAX);
+            superblock.put_u16_le((options.pcluster_size / BLOCK_SIZE as u32) as u16);
+            superblock.put_bytes(0, 10);
+        }
         Compression::None | Compression::Lz4 => {}
         Compression::Lzma => {
             superblock.put_u16_le(14);

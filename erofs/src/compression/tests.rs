@@ -527,13 +527,17 @@ fn decoded_extent_limit_is_checked_before_decoding() {
             data[at] = 2;
             (&mut data[at + 4..]).put_u16_le(index.min(2047) as u16);
         }
-        let result = plan(&data, 0);
-        if length == MAX_DECODED_SIZE {
-            assert!(
-                matches!(result, Ok(BlockPlan::Encoded(EncodedExtent { decoded_size, .. })) if decoded_size as u64 == length)
-            );
-        } else {
-            assert!(matches!(result, Err(Error::NotSupported(_))));
+        // Full-index fixtures also cover long lookbacks across metadata pages.
+        // These reader-only formats do not need hidden production builder knobs.
+        for offset in [0, length / 2 + 17, length - 1] {
+            let result = plan(&data, offset);
+            if length == MAX_DECODED_SIZE {
+                assert!(
+                    matches!(result, Ok(BlockPlan::Encoded(EncodedExtent { decoded_size, .. })) if decoded_size as u64 == length)
+                );
+            } else {
+                assert!(matches!(result, Err(Error::NotSupported(_))));
+            }
         }
     }
 }

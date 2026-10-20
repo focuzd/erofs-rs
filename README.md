@@ -151,8 +151,9 @@ erofs_rs::build::from_directory("rootfs", "image.erofs")?;
 ```
 
 Use `Options::default().uuid(...).build_time(...).build_from_directory(source, destination)`
-to set the same UUID and creation time. Identical ordered entries (or an unchanged source directory) and
-options produce identical image bytes; inode metadata is preserved, not normalized.
+to set the same UUID and creation time. Identical ordered entries (or an unchanged source directory)
+and options produce identical image bytes on the same target and encoder versions;
+inode metadata is preserved, not normalized.
 
 Directory import uses
 Unix metadata and `rustix` xattr enumeration (Linux, Android, Apple platforms and Hurd).
@@ -165,7 +166,7 @@ throughout the build; this is not a filesystem snapshot. Files are copied with b
 buffers, while directory entries and metadata are kept in memory. Permissions, UID/GID,
 modification times and raw names/link targets are preserved. FIFOs and character/block
 devices are imported as metadata only, preserving device numbers without opening them.
-Reported xattrs are read without following symlinks and stored inline. Unsupported
+Reported xattrs are read without following symlinks and stored inline by default. Unsupported
 namespaces, format limits and attribute read errors fail the build rather than
 silently losing metadata. Sockets remain explicitly rejected. Hard-link counts include only links
 inside the image.
@@ -209,7 +210,7 @@ Repeat `--device` in device-table order; `dump` and `inspect` accept all-local p
 # Build an uncompressed image (e.g. Linux/macOS; output must be new and outside rootfs)
 erofs-cli build rootfs -o image.erofs
 
-# Compress regular files with Full indexes (none|lz4|lzma|deflate|zstd; default: none)
+# Compress regular files with Compact indexes (none|lz4|lzma|deflate|zstd; default: none)
 erofs-cli build rootfs -o compressed.erofs --compression zstd
 
 # Set a fixed UUID and creation time, without changing inode modification times
@@ -250,11 +251,12 @@ erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
 - [x] Chunk-based reading (including indexed/48-bit chunks) and additional devices (chunk IDs/unified addresses)
 - [x] Metabox metadata reading (inodes, indexes, inline data and xattrs)
 - [x] Compressed reading: LZ4, MicroLZMA, DEFLATE and Zstd (layouts and limits above)
-- [x] Xattrs: inline/shared/long-prefix reading; inline writing/import, including cross-block bodies
+- [x] Xattrs: inline/shared/long-prefix reading and writing/import, including cross-block bodies
 - [x] Directory traversal (`walk_dir`) and tar export
 - [x] Sync/async incremental builders (`Builder` / `AsyncBuilder`) and Unix directory import,
-  with compact/extended inodes, optional LZ4/MicroLZMA/DEFLATE/Zstd Full-index compression, hard links,
-  FIFOs and character/block devices
+  with compact/extended inodes, optional LZ4/MicroLZMA/DEFLATE/Zstd Compact-index compression,
+  opt-in larger clusters, inline compressed tails and fragments,
+  hard links, FIFOs, sockets and character/block devices
 - [x] Image UUID/creation-time configuration and superblock CRC32C generation (reader verification pending)
 
 ### TODO

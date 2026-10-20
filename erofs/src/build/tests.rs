@@ -81,6 +81,52 @@ fn superblock_checksum(image: &[u8]) -> u32 {
     !crc32c::crc32c(&covered)
 }
 
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+#[test]
+fn rejected_inline_candidates_fall_back_to_external_storage() {
+    let mut seed = 7u32;
+    let random: Vec<u8> = (0..8192)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    // Extended inode + xattrs + two Compact indexes leave only eight bytes
+    // of page slack, too little for either tail to be stored inline.
+    let metadata = with_xattrs(xattrs([(b"user.x", &vec![0; 3988])]));
+    for compression in COMPRESSIONS
+        .into_iter()
+        .filter(|codec| *codec != Compression::None && codec.enabled())
+    {
+        let options = Options::default()
+            .compression(compression)
+            .inode_format(InodeFormat::Extended)
+            .inline_compressed_tails(true);
+        for input in [&[0; 8192][..], random.as_slice()] {
+            let mut builder = options.build(Cursor::new(Vec::new())).unwrap();
+            builder
+                .append_file("file", &metadata, input.len() as u64, input)
+                .unwrap();
+            let image = builder.finish().unwrap().into_inner();
+            let fs = crate::EroFS::new(SliceImage::new(&image)).unwrap();
+            assert_eq!(
+                fs.super_block().feature_incompat & 0x10,
+                0,
+                "{compression:?}"
+            );
+            assert_eq!(read_all(fs.open("file").unwrap()), input);
+            assert_eq!(fs.xattrs("file").unwrap(), metadata.xattrs);
+        }
+    }
+}
+
 #[test]
 fn builder_streams_explicit_metadata_and_byte_paths() {
     let metadata = &extended_metadata();
@@ -967,7 +1013,7 @@ mod r#async {
         feature = "zstd"
     ))]
     #[test]
-    fn compressed_full_indexes_preserve_streams_metadata_and_boundaries() {
+    fn compressed_compact_indexes_preserve_streams_metadata_and_boundaries() {
         use crate::types::Layout;
 
         for compression in COMPRESSIONS
@@ -993,7 +1039,7 @@ mod r#async {
                     0, 1, 4095, 4096, 4097, 8191, 8192, 12289, 65535, 65536, 65537,
                 ]
                 .into_iter()
-                .chain([3 * 1024 * 1024 + 17])
+                .chain([9 * 1024 * 1024 + 17])
                 .enumerate()
                 {
                     // One large mixed input per codec covers index-page streaming;
@@ -1072,7 +1118,7 @@ mod r#async {
                         inode.modified_unix() => metadata.modified;
                         fs.xattrs(path).unwrap() => metadata.xattrs;
                         ready(afs.xattrs(path)).unwrap() => metadata.xattrs;
-                        inode.layout() == Some(Layout::CompressedFull) => data.len() >= 8192;
+                        inode.layout() == Some(Layout::CompressedCompact) => data.len() >= 8192;
                     }
                     let mut file = fs.open(path).unwrap();
                     assert_eq!(&read_all(&mut file), data);
@@ -1089,9 +1135,117 @@ mod r#async {
                     }
                 }
                 let link = find_inode(&entries, "/link");
-                assert_ne!(link.layout(), Some(Layout::CompressedFull));
+                assert_ne!(link.layout(), Some(Layout::CompressedCompact));
                 assert_eq!(fs.read_link_inode(link).unwrap().as_bytes(), target);
             }
+        }
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
+    fn compact_index_packs_cover_alignment_transitions_and_odd_counts() {
+        use crate::types::Layout;
+
+        let compression = COMPRESSIONS
+            .into_iter()
+            .find(|c| *c != Compression::None && c.enabled())
+            .unwrap();
+        for format in [Compact, Extended] {
+            let options = Options::default()
+                .compression(compression)
+                .inode_format(format);
+            let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+            let mut asynchronous = complete(options.build_async(AsyncOutput::new())).unwrap();
+            let mut expected = BTreeMap::new();
+            let mut random = 7u32;
+            // Xattrs exercise every index-start residue modulo 32, including the
+            // 4-byte padding before the map header. Counts straddle both pack widths.
+            for value_len in [0, 8, 16, 24] {
+                let metadata = with_xattrs(xattrs([(b"user.x", &vec![42; value_len])]));
+                for count in 2usize..=39 {
+                    let path = format!("f-{value_len}-{count}");
+                    let size = count * 4096 - usize::from(!count.is_multiple_of(2));
+                    let data: Vec<_> = (0..size)
+                        .map(|_| {
+                            random ^= random << 13;
+                            random ^= random >> 17;
+                            random ^= random << 5;
+                            if count.is_multiple_of(3) {
+                                random as u8
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                    append_stream(&mut sync, &mut asynchronous, &path, &metadata, &data);
+                    expected.insert(path, (data, metadata.clone()));
+                }
+            }
+            let image = sync.finish().unwrap().into_inner();
+            assert_eq!(image, finish(asynchronous));
+            let source = source(&image);
+            let fs = crate::EroFS::new(&source).unwrap();
+            let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
+            let entries = collect_entries(fs.read_dir("/").unwrap());
+            let mut residues = std::collections::BTreeSet::new();
+            for (path, (data, metadata)) in expected {
+                let inode = find_inode(&entries, format!("/{path}"));
+                assert_eq!(inode.layout(), Some(Layout::CompressedCompact));
+                let mut node = Node::new(&metadata, Content::File, data.len() as u64).unwrap();
+                node.select_format(&options, 1).unwrap();
+                node.compression = compression;
+                node.nid = inode.id();
+                let start = node.index_offset() as usize;
+                residues.insert(start % 32);
+                assert_eq!((&image[start - 4..]).get_u16_le(), 1);
+                if path == "f-8-22" {
+                    // erofs-utils Full-to-Compact conversion: two extents of
+                    // 16 and 6 blocks, three 4B packs followed by one 2B pack.
+                    let golden: [&[u8]; 4] = [
+                        &[0x00, 0x10, 0x0f, 0x20],
+                        &[0x02, 0x20, 0x0d, 0x20],
+                        &[0x04, 0x20, 0x0b, 0x20],
+                        &[
+                            0x06, 0xe0, 0x01, 0x88, 0x00, 0x26, 0x80, 0x0a, 0xe0, 0x02, 0xc8, 0x00,
+                            0x36, 0x80, 0x0e, 0xe0, 0x03, 0x08, 0x00, 0x05, 0x80, 0x02, 0xe0, 0x00,
+                            0x48, 0x00, 0x06, 0x80,
+                        ],
+                    ];
+                    let base = (&image[start + 4..]).get_u32_le();
+                    let mut offset = start;
+                    for (i, bytes) in golden.into_iter().enumerate() {
+                        assert_eq!(&image[offset..offset + bytes.len()], bytes);
+                        offset += bytes.len();
+                        assert_eq!((&image[offset..]).get_u32_le(), base + u32::from(i != 0));
+                        offset += 4;
+                    }
+                    assert_eq!(offset as u64, node.metadata_end());
+                }
+                let count = data.len().div_ceil(4096);
+                // Final odd packs contain a zero PLAIN mate, never a missing half-pack.
+                if !count.is_multiple_of(2) {
+                    let end = node.metadata_end() as usize;
+                    assert_eq!(&image[end - 6..end - 4], &[0; 2]);
+                }
+                assert_eq!(fs.xattrs(&path).unwrap(), metadata.xattrs);
+                let mut file = fs.open(&path).unwrap();
+                assert_eq!(read_all(&mut file), data);
+                let afile = ready(afs.open(&path)).unwrap();
+                // Visit every logical cluster in reverse, bypassing sequential caches.
+                for at in (0..data.len()).step_by(4096).rev() {
+                    let mut buf = [0xa5; 17];
+                    let n = file.read_at(&mut buf, at as u64).unwrap();
+                    assert_eq!(&buf[..n], &data[at..at + n]);
+                    let n = ready(afile.read_at(&mut buf, at as u64)).unwrap();
+                    assert_eq!(&buf[..n], &data[at..at + n]);
+                }
+            }
+            assert_eq!(residues, [0, 8, 16, 24].into());
         }
     }
 
@@ -1137,7 +1291,8 @@ mod r#async {
                 4096,
                 4096 + 13,
                 4096 + 32 * 4096 + 13,
-                4096 + 48 * 4096 + 4096 + 13,
+                4096 + 128 * 4096 + 13,
+                4096 + 144 * 4096 + 4096 + 13,
             ] {
                 let output = Output::new(remaining);
                 let mut sync = options.build(output).unwrap();
@@ -1145,10 +1300,10 @@ mod r#async {
                 output.inner.remaining = remaining;
                 let mut asynchronous = complete(options.build_async(output)).unwrap();
                 assert!(
-                    sync.append_file("f", &metadata, 3 * 1024 * 1024, io::repeat(0))
+                    sync.append_file("f", &metadata, 9 * 1024 * 1024, io::repeat(0))
                         .is_err()
                 );
-                let data = vec![0; 3 * 1024 * 1024];
+                let data = vec![0; 9 * 1024 * 1024];
                 assert!(
                     complete(asynchronous.append_file(
                         "f",
@@ -1173,6 +1328,413 @@ mod r#async {
             assert!(complete(asynchronous.finish()).is_err());
             assert_eq!(&output.inner.data.get_ref()[1024..1028], &[0; 4]);
         }
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
+    fn advanced_compression_keeps_streams_and_metadata_in_both_drivers() {
+        let mut seed = 7u32;
+        let random: Vec<_> = (0..65536)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let moderate = [&random[..12288], &[0; 20480][..]].concat().repeat(2);
+        let inputs = [
+            vec![0; 8192],
+            moderate,
+            [&random[..], &random[..3073]].concat(),
+            [&random[..], &random[..4095]].concat(),
+            vec![0; 65537],
+        ];
+        for compression in COMPRESSIONS
+            .into_iter()
+            .filter(|c| *c != Compression::None && c.enabled())
+        {
+            for format in [Compact, Extended] {
+                for cluster in [4096, 16384, 65536] {
+                    for (inline, fragments) in [(true, false), (false, true), (true, true)] {
+                        let options = Options::default()
+                            .compression(compression)
+                            .inode_format(format)
+                            .pcluster_size(cluster)
+                            .inline_compressed_tails(inline)
+                            .fragments(fragments)
+                            .shared_xattrs(true)
+                            .xattr_prefixes(true);
+                        let metadata = with_xattrs(xattrs([
+                            (b"user.very.long.prefix.value", &vec![42; 3970]),
+                            (b"user.very.long.prefix.empty", b""),
+                        ]));
+                        let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+                        let mut asynchronous =
+                            complete(options.build_async(AsyncOutput::new())).unwrap();
+                        for (i, data) in inputs.iter().enumerate() {
+                            append_stream(
+                                &mut sync,
+                                &mut asynchronous,
+                                format!("f-{i}"),
+                                &metadata,
+                                data,
+                            );
+                        }
+                        both!(sync, asynchronous;
+                            append_hard_link("alias", "f-2") => unwrap;
+                            append_dir("dir", &metadata) => unwrap;
+                        );
+                        let image = sync.finish().unwrap().into_inner();
+                        assert_eq!(image, finish(asynchronous));
+                        let source = source(&image);
+                        let fs = crate::EroFS::new(&source).unwrap();
+                        let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
+                        let sb = fs.super_block();
+                        assert_eq!(sb.checksum, superblock_checksum(&image));
+                        assert_ne!(sb.feature_incompat & 0x40, 0);
+                        if inline {
+                            assert_ne!(sb.feature_incompat & 0x10, 0);
+                        }
+                        if fragments && !inline {
+                            assert_ne!(sb.feature_incompat & 0x24, 0);
+                            assert_ne!(sb.packed_nid, 0);
+                        }
+                        if sb.packed_nid != 0 {
+                            // Linux <=6.14 follows packed_nid unconditionally for
+                            // prefixes: do not rely on the newer plain-prefix flag.
+                            assert_eq!(sb.feature_compat & 0x10, 0);
+                            let packed = fs.get_inode(sb.packed_nid).unwrap();
+                            assert!(u64::from(sb.xattr_prefix_start) * 4 < packed.data_size());
+                        }
+                        let entries = collect_entries(fs.read_dir("/").unwrap());
+                        assert_eq!(entries.len(), inputs.len() + 2);
+                        for (i, data) in inputs.iter().enumerate() {
+                            let path = format!("f-{i}");
+                            let mut file = fs.open(&path).unwrap();
+                            assert_eq!(read_all(&mut file), *data);
+                            let afile = ready(afs.open(&path)).unwrap();
+                            check_read_at(&file, &afile, data);
+                            assert_eq!(fs.xattrs(&path).unwrap(), metadata.xattrs);
+                            assert_eq!(ready(afs.xattrs(&path)).unwrap(), metadata.xattrs);
+                        }
+                        assert_eq!(fs.xattrs("dir").unwrap(), metadata.xattrs);
+                        assert_eq!(read_all(fs.open("alias").unwrap()), inputs[2]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
+    fn packed_indexes_stream_across_pages_and_fragment_flush_errors_poison() {
+        let compression = COMPRESSIONS
+            .into_iter()
+            .find(|c| *c != Compression::None && c.enabled())
+            .unwrap();
+        let options = Options::default()
+            .compression(compression)
+            .fragments(true)
+            .pcluster_size(16384);
+        let metadata = Metadata::default();
+        let data = vec![0; 8192 + 4095];
+        let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+        let mut asynchronous = complete(options.build_async(Cursor::new(Vec::new()))).unwrap();
+        for i in 0..1030 {
+            let path = format!("f-{i}");
+            both!(sync, asynchronous;
+                append_file(&path, &metadata, data.len() as u64, data.as_slice()).await => unwrap;
+            );
+        }
+        let image = sync.finish().unwrap().into_inner();
+        assert_eq!(image, complete(asynchronous.finish()).unwrap().into_inner());
+        let fs = crate::EroFS::new(SliceImage::new(&image)).unwrap();
+        assert_eq!(fs.super_block().inos, 1032); // root + files + hidden packed inode.
+        for i in [0, 1, 1015, 1016, 1023, 1024, 1029] {
+            assert_eq!(read_all(fs.open(format!("f-{i}")).unwrap()), data);
+        }
+        let options = options.xattr_prefixes(true);
+        let metadata = with_xattrs(
+            (0..128)
+                .map(|i| {
+                    (
+                        format!("user.{i:03}{}", "n".repeat(247)).into_bytes(),
+                        vec![42; 8],
+                    )
+                })
+                .collect(),
+        );
+        let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+        let mut asynchronous = complete(options.build_async(Cursor::new(Vec::new()))).unwrap();
+        both!(sync, asynchronous;
+            append_file("prefixes", &metadata, data.len() as u64, data.as_slice()).await => unwrap;
+        );
+        let image = sync.finish().unwrap().into_inner();
+        assert_eq!(image, complete(asynchronous.finish()).unwrap().into_inner());
+        let fs = crate::EroFS::new(SliceImage::new(&image)).unwrap();
+        assert_eq!(fs.super_block().xattr_prefix_count, 128);
+        assert_eq!(fs.super_block().xattr_prefix_start, 1024);
+        assert_eq!(
+            fs.get_inode(fs.super_block().packed_nid)
+                .unwrap()
+                .data_size(),
+            9 * 4096
+        );
+        assert_eq!(fs.xattrs("prefixes").unwrap(), metadata.xattrs);
+        assert_eq!(read_all(fs.open("prefixes").unwrap()), data);
+        let metadata = Metadata::default();
+        let mut seed = 3u32;
+        let random: Vec<_> = (0..65536 + 4095)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        // Both files' external data fit; the shared fragment-page flush fails.
+        let remaining = 4096 + 2 * 65536 + 13;
+        let mut sync = options.build(Output::new(remaining)).unwrap();
+        let mut output = AsyncOutput::new();
+        output.inner.remaining = remaining;
+        let mut asynchronous = complete(options.build_async(output)).unwrap();
+        both!(sync, asynchronous;
+            append_file("first", &metadata, random.len() as u64, random.as_slice()).await => unwrap;
+            append_file("second", &metadata, random.len() as u64, random.as_slice()).await => unwrap_err;
+            append_dir("after-error", &metadata) => unwrap_err;
+        );
+        assert!(sync.finish().is_err());
+        assert!(complete(asynchronous.finish()).is_err());
+        let mut output = AsyncOutput::new();
+        output.freeze_at = Some(8192 + 13);
+        let mut asynchronous = complete(options.build_async(&mut output)).unwrap();
+        cancel_pending(
+            asynchronous.append_file("cancel", &metadata, random.len() as u64, random.as_slice()),
+            100,
+        );
+        assert!(complete(asynchronous.finish()).is_err());
+    }
+
+    #[test]
+    fn root_xattr_deduplication_reclaims_only_trailing_reservations() {
+        let contents = vec![42; 8193];
+        let metadata = with_xattrs(xattrs([(b"user.large", &vec![42; 10000])]));
+        for format in [Compact, Extended] {
+            for shared in [false, true] {
+                for root_position in 0..=2 {
+                    for child_directories in [0, 300] {
+                        let options = Options::default()
+                            .inode_format(format)
+                            .shared_xattrs(shared);
+                        let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+                        let mut asynchronous =
+                            complete(options.build_async(Cursor::new(Vec::new()))).unwrap();
+                        for step in 0..=2 {
+                            if step == root_position {
+                                both!(sync, asynchronous; append_dir("/", &metadata) => unwrap;);
+                            }
+                            if step < 2 {
+                                both!(sync, asynchronous;
+                                    append_file(format!("file-{step}"), &metadata, contents.len() as u64, contents.as_slice()).await => unwrap;
+                                );
+                            }
+                        }
+                        // Exercise external directory data and subsequent allocations
+                        // after the root reservation shrinks.
+                        for i in 0..child_directories {
+                            both!(sync, asynchronous;
+                                append_dir(format!("child-{i:04}"), Metadata::default()) => unwrap;
+                            );
+                        }
+                        let image = sync.finish().unwrap().into_inner();
+                        assert_eq!(image, complete(asynchronous.finish()).unwrap().into_inner());
+                        let source = source(&image);
+                        let fs = crate::EroFS::new(&source).unwrap();
+                        let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
+                        assert_eq!(fs.super_block().block_count() * 4096, image.len() as u64);
+                        assert_eq!(fs.super_block().checksum, superblock_checksum(&image));
+                        for path in ["/", "file-0", "file-1"] {
+                            assert_eq!(fs.xattrs(path).unwrap(), metadata.xattrs);
+                            assert_eq!(ready(afs.xattrs(path)).unwrap(), metadata.xattrs);
+                        }
+                        for path in ["file-0", "file-1"] {
+                            let file = fs.open(path).unwrap();
+                            check_read_at(&file, &ready(afs.open(path)).unwrap(), &contents);
+                            assert_eq!(read_all(file), contents);
+                        }
+                        assert_eq!(
+                            collect_entries(fs.read_dir("/").unwrap()).len(),
+                            child_directories + 2
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
+    fn compressed_indexes_stream_across_metadata_pages() {
+        let zeros = vec![0; 12 * 1024 * 1024];
+        let mut mixed = vec![0; 1024 * 1024];
+        let mut random = 0x31d2_17abu32;
+        for chunk in mixed.chunks_mut(4096) {
+            for byte in &mut chunk[..1024] {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                *byte = random as u8;
+            }
+        }
+        for compression in COMPRESSIONS
+            .into_iter()
+            .filter(|c| *c != Compression::None && c.enabled())
+        {
+            for (inline, fragments) in [(false, false), (true, false), (false, true)] {
+                let options = Options::default()
+                    .compression(compression)
+                    .pcluster_size(1024 * 1024)
+                    .inline_compressed_tails(inline)
+                    .fragments(fragments);
+                let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+                let mut asynchronous =
+                    complete(options.build_async(Cursor::new(Vec::new()))).unwrap();
+                both!(sync, asynchronous;
+                    append_file("file", Metadata::default(), zeros.len() as u64, zeros.as_slice()).await => unwrap;
+                    append_file("tail", Metadata::default(), 65553, &zeros[..65553]).await => unwrap;
+                    append_file("mixed", Metadata::default(), mixed.len() as u64, mixed.as_slice()).await => unwrap;
+                );
+                let image = sync.finish().unwrap().into_inner();
+                assert_eq!(image, complete(asynchronous.finish()).unwrap().into_inner());
+                let source = source(&image);
+                let fs = crate::EroFS::new(&source).unwrap();
+                let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
+                for (path, expected) in [
+                    ("file", zeros.as_slice()),
+                    ("tail", &zeros[..65553]),
+                    ("mixed", mixed.as_slice()),
+                ] {
+                    let file = fs.open(path).unwrap();
+                    check_read_at(&file, &ready(afs.open(path)).unwrap(), expected);
+                    assert_eq!(read_all(file), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_attributes_and_prefixes_cover_limits_and_directory_only_images() {
+        for (shared, prefixes) in [(true, false), (false, true), (true, true)] {
+            let options = Options::default()
+                .shared_xattrs(shared)
+                .xattr_prefixes(prefixes);
+            let metadata = with_xattrs(
+                (0..256)
+                    .map(|i| {
+                        (
+                            format!("user.unique-long-name-{i:03}").into_bytes(),
+                            vec![42; 8],
+                        )
+                    })
+                    .collect(),
+            );
+            for directories in [false, true] {
+                let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+                let mut asynchronous = complete(options.build_async(AsyncOutput::new())).unwrap();
+                if directories {
+                    both!(sync, asynchronous;
+                        append_dir("/", &metadata) => unwrap;
+                        append_dir("first", &metadata) => unwrap;
+                        append_dir("second", &metadata) => unwrap;
+                    );
+                } else {
+                    append_stream(&mut sync, &mut asynchronous, "first", &metadata, &[]);
+                    append_stream(&mut sync, &mut asynchronous, "second", &metadata, b"inline");
+                }
+                let image = sync.finish().unwrap().into_inner();
+                assert_eq!(image, finish(asynchronous));
+                let fs = crate::EroFS::new(SliceImage::new(&image)).unwrap();
+                assert_eq!(fs.xattrs("first").unwrap(), metadata.xattrs);
+                assert_eq!(fs.xattrs("second").unwrap(), metadata.xattrs);
+                assert_eq!(
+                    fs.super_block().xattr_prefix_count,
+                    if prefixes { 128 } else { 0 }
+                );
+                assert_eq!(fs.super_block().checksum, superblock_checksum(&image));
+                let entries = collect_entries(fs.read_dir("/").unwrap());
+                let inode = find_inode(&entries, "/second");
+                let at = inode.id() as usize * 32 + inode.inode_size as usize;
+                assert_eq!(image[at + 4], if shared { 255 } else { 0 });
+            }
+        }
+        let options = Options::default().shared_xattrs(true).xattr_prefixes(true);
+        // The bounded cache deliberately falls back to inline records after filling.
+        let mut builder = options.build(Cursor::new(Vec::new())).unwrap();
+        for (index, i) in (0..64).chain([0, 63]).enumerate() {
+            let attrs = with_xattrs(xattrs([(b"user.long-cache-key", &vec![i as u8; 8192])]));
+            builder
+                .append_file(format!("entry-{}", index + 1), &attrs, 0, Unread)
+                .unwrap();
+        }
+        let image = builder.finish().unwrap().into_inner();
+        let fs = crate::EroFS::new(SliceImage::new(&image)).unwrap();
+        for (path, value) in [("entry-65", 0), ("entry-66", 63)] {
+            assert_eq!(
+                fs.xattrs(path).unwrap()[b"user.long-cache-key".as_slice()],
+                vec![value; 8192]
+            );
+        }
+        for options in [
+            Options::default().inline_compressed_tails(true),
+            Options::default().fragments(true),
+            Options::default().pcluster_size(0),
+            Options::default().pcluster_size(8193),
+            Options::default().pcluster_size(69632),
+        ] {
+            let mut output = Cursor::new(b"keep".to_vec());
+            output.set_position(2);
+            assert!(options.build(&mut output).is_err());
+            assert!(complete(options.build_async(&mut output)).is_err());
+            assert_eq!(output.position(), 2);
+            assert_eq!(output.into_inner(), b"keep");
+        }
+        let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+        let mut asynchronous = complete(options.build_async(AsyncOutput::new())).unwrap();
+        both!(sync, asynchronous;
+            append_file("huge", with_xattrs(xattrs([(b"user.new-long-prefix.x", b"v")])), u64::MAX, Unread).await => unwrap_err;
+            append_file("../invalid", with_xattrs(xattrs([(b"user.new-long-prefix.x", b"v")])), 0, Unread).await => unwrap_err;
+        );
+        let image = sync.finish().unwrap().into_inner();
+        assert_eq!(image, finish(asynchronous));
+        let fs = crate::EroFS::new(SliceImage::new(&image)).unwrap();
+        assert_eq!(fs.super_block().xattr_prefix_count, 0);
+        let mut state = State::new(options).unwrap();
+        let metadata = with_xattrs(xattrs([(b"user.address-limit-prefix", b"value")]));
+        let entry = state
+            .prepare_payload(UnixPath::new("file"), &metadata, Content::File, 0, 1)
+            .unwrap();
+        state.commit_payload(entry);
+        state.next_block = 1 << 22; // 16 GiB, checked without allocating/writing it.
+        assert!(matches!(
+            state.layout(),
+            Err(Error::Overflow("xattr prefix address"))
+        ));
     }
 
     #[test]
@@ -2007,7 +2569,7 @@ mod r#async {
     #[test]
     fn special_files_share_encoding_validation_and_hard_links() {
         use crate::types::DirentFileType as Kind;
-        use SpecialFile::{BlockDevice as Block, CharacterDevice as Char, Fifo};
+        use SpecialFile::{BlockDevice as Block, CharacterDevice as Char, Fifo, Socket};
         use std::os::unix::fs::PermissionsExt;
 
         let metadata = &extended_metadata();
@@ -2032,6 +2594,7 @@ mod r#async {
         #[rustfmt::skip] // Keep each input beside its independent on-disk expectations.
         let cases = [
             (Fifo, Kind::Fifo, 0o010000, None, 0u32),
+            (Socket, Kind::Socket, 0o140000, None, 0),
             (Char { major: 1, minor: 3 }, Kind::CharacterDevice,
                 0o020000, Some((1, 3)), 0x103),
             (Block { major: 8, minor: 257 }, Kind::BlockDevice,

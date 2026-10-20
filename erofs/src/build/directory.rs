@@ -142,7 +142,7 @@ pub(super) fn scan(root: &Path) -> Result<Vec<Source>> {
     target_os = "hurd"
 ))]
 fn read_xattrs(path: &Path) -> Result<Xattrs> {
-    use super::encode::{MAX_XATTR_SIZE, xattr_entry_size};
+    use super::encode::{MAX_XATTR_SIZE, xattr_entry_size, xattr_name};
     use rustix::fs::{lgetxattr, llistxattr};
 
     let len = llistxattr(path, &mut [0u8; 0]).map_err(io::Error::from)?;
@@ -163,8 +163,9 @@ fn read_xattrs(path: &Path) -> Result<Xattrs> {
     let mut attrs = Xattrs::new();
     let mut size = size_of::<crate::types::XattrHeader>();
     for name in names[..len - 1].split(|&byte| byte == 0) {
+        let (_, suffix) = xattr_name(name)?;
         let len = lgetxattr(path, name, &mut [0u8; 0]).map_err(io::Error::from)?;
-        size += xattr_entry_size(name, len)?;
+        size += xattr_entry_size(suffix.len(), len)?;
         if size > MAX_XATTR_SIZE {
             return Err(Error::Overflow("inode xattr size"));
         }
@@ -172,11 +173,7 @@ fn read_xattrs(path: &Path) -> Result<Xattrs> {
         if lgetxattr(path, name, value.as_mut_slice()).map_err(io::Error::from)? != len {
             return Err(io::Error::other("source xattr value changed during image build").into());
         }
-        if attrs.insert(name.to_vec(), value).is_some() {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "duplicate host xattr name").into(),
-            );
-        }
+        attrs.insert(name.to_vec(), value);
     }
     Ok(attrs)
 }

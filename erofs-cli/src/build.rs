@@ -32,6 +32,21 @@ pub struct BuildArgs {
     /// Inode headers; compact rejects unrepresentable metadata rather than changing it.
     #[arg(long, default_value = "auto", value_parser = ["auto", "compact", "extended"])]
     inode_format: String,
+    /// Maximum physical compression cluster in bytes (4096..=1048576, multiple of 4096).
+    #[arg(long, default_value_t = 4096)]
+    pcluster_size: u32,
+    /// Store final compression extents in unused index-page space.
+    #[arg(long)]
+    inline_compressed_tails: bool,
+    /// Pack remaining short compression tails into a hidden file.
+    #[arg(long)]
+    fragments: bool,
+    /// Reuse identical xattr records through a bounded exact-match cache.
+    #[arg(long)]
+    shared_xattrs: bool,
+    /// Deduplicate long xattr name prefixes (up to 128 prefixes).
+    #[arg(long)]
+    xattr_prefixes: bool,
 }
 
 pub fn build(args: BuildArgs) -> Result<()> {
@@ -50,6 +65,11 @@ pub fn build(args: BuildArgs) -> Result<()> {
             "extended" => InodeFormat::Extended,
             _ => InodeFormat::Auto,
         })
+        .pcluster_size(args.pcluster_size)
+        .inline_compressed_tails(args.inline_compressed_tails)
+        .fragments(args.fragments)
+        .shared_xattrs(args.shared_xattrs)
+        .xattr_prefixes(args.xattr_prefixes)
         .build_from_directory(args.source, args.output)
         .context("failed to build EROFS image")
 }
