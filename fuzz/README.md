@@ -1,14 +1,15 @@
 # Fuzzing
 
 This is an independent cargo-fuzz workspace. Its dependencies, lockfile and
-release profile do not affect the library or its Rust 1.91 MSRV. All harness code
+release profile do not affect the library or its Rust 1.92 MSRV. All harness code
 lives here and uses public library APIs; no fuzz-specific hooks or configuration
 are added to the library.
 
 ## Run
 
-Requires nightly Rust and a C++ compiler (for libFuzzer). Do not change the
-project's default toolchain:
+Requires nightly Rust and a C++ compiler (for libFuzzer). All compression
+codecs, including Zstd via `zrip`, are pure Rust. Do not change the project's
+default toolchain:
 
 ```sh
 rustup toolchain install nightly
@@ -86,7 +87,7 @@ cargo +nightly test --manifest-path fuzz/Cargo.toml --lib --locked
 cargo +nightly test --manifest-path fuzz/Cargo.toml --lib --no-default-features --locked
 
 # Also exercise the alloc-only library configuration on the host.
-cargo +nightly fuzz run compression --no-default-features --features lz4,deflate,zstd -- -max_total_time=60
+cargo +nightly fuzz run compression --no-default-features --features lz4,deflate -- -max_total_time=60
 
 cargo +nightly fuzz run compression fuzz/artifacts/compression/crash-REPLACE
 cargo +nightly fuzz tmin compression fuzz/artifacts/compression/crash-REPLACE

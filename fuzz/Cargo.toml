@@ -16,7 +16,7 @@ std = ["erofs-rs/std"]
 lz4 = ["erofs-rs/lz4"]
 lzma = ["std", "erofs-rs/lzma"]
 deflate = ["erofs-rs/deflate"]
-zstd = ["erofs-rs/zstd"]
+zstd = ["std", "erofs-rs/zstd"]
 
 [dependencies]
 bytes = { version = "1", default-features = false }

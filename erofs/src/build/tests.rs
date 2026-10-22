@@ -1013,6 +1013,70 @@ mod r#async {
         feature = "zstd"
     ))]
     #[test]
+    fn compressed_async_builders_migrate_between_threads() {
+        let data: Vec<_> = (0..131_169).map(|i| ((i * 31) ^ (i / 97)) as u8).collect();
+        let metadata = Metadata::default();
+        for compression in COMPRESSIONS
+            .into_iter()
+            .filter(|compression| *compression != Compression::None && compression.enabled())
+        {
+            let options = Options::default().compression(compression);
+            let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+            for (path, bytes) in [("large", &data[..]), ("short", &data[..16384])] {
+                sync.append_file(path, &metadata, bytes.len() as u64, &mut Cursor::new(bytes))
+                    .unwrap();
+            }
+            let expected = sync.finish().unwrap().into_inner();
+            let mut future = alloc::boxed::Box::pin(async {
+                let mut builder = options.build_async(AsyncOutput::new()).await.unwrap();
+                for (path, bytes) in [("large", &data[..]), ("short", &data[..16384])] {
+                    let mut reader = Reader {
+                        data: Cursor::new(bytes.to_vec()),
+                        ready: Cell::new(false),
+                        fail: false,
+                    };
+                    builder
+                        .append_file(path, &metadata, bytes.len() as u64, &mut reader)
+                        .await
+                        .unwrap();
+                }
+                builder.finish().await.unwrap().inner.data.into_inner()
+            });
+            let actual = std::thread::scope(|scope| {
+                for migration in 0..128 {
+                    // Move the pinned future, including a live streaming Compressor,
+                    // to a fresh worker after each bounded batch of I/O polls.
+                    let (next, result) = scope
+                        .spawn(move || {
+                            let mut cx = Context::from_waker(Waker::noop());
+                            for _ in 0..1024 {
+                                if let Poll::Ready(image) = future.as_mut().poll(&mut cx) {
+                                    return (future, Some(image));
+                                }
+                            }
+                            (future, None)
+                        })
+                        .join()
+                        .unwrap();
+                    future = next;
+                    if let Some(image) = result {
+                        assert!(migration > 1);
+                        return image;
+                    }
+                }
+                panic!("migrating async builder made no progress")
+            });
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
     fn compressed_compact_indexes_preserve_streams_metadata_and_boundaries() {
         use crate::types::Layout;
 
@@ -1106,7 +1170,7 @@ mod r#async {
                     assert_eq!(inode.nlink(), 2);
                     let offset = inode.id() as usize * 32;
                     assert_eq!(image[offset] & 1, u8::from(!compact));
-                    if data.len() >= 8192 {
+                    if inode.layout() == Some(Layout::CompressedCompact) {
                         let blocks = (&image[offset + 16..]).get_u32_le() as usize;
                         assert!(blocks > 0 && blocks <= data.len().div_ceil(4096));
                         if data.len() >= 8192 && data.iter().all(|&b| b == 0) {
@@ -1118,7 +1182,8 @@ mod r#async {
                         inode.modified_unix() => metadata.modified;
                         fs.xattrs(path).unwrap() => metadata.xattrs;
                         ready(afs.xattrs(path)).unwrap() => metadata.xattrs;
-                        inode.layout() == Some(Layout::CompressedCompact) => data.len() >= 8192;
+                        inode.layout() == Some(Layout::CompressedCompact) => data.len() > 65536
+                            || (data.len() > 4096 && data.iter().all(|&b| b == 0));
                     }
                     let mut file = fs.open(path).unwrap();
                     assert_eq!(&read_all(&mut file), data);
@@ -1137,6 +1202,211 @@ mod r#async {
                 let link = find_inode(&entries, "/link");
                 assert_ne!(link.layout(), Some(Layout::CompressedCompact));
                 assert_eq!(fs.read_link_inode(link).unwrap().as_bytes(), target);
+            }
+        }
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
+    fn short_files_use_compression_only_when_it_beats_flat_storage() {
+        use crate::types::Layout;
+
+        let mut seed = 7u32;
+        let random: Vec<_> = (0..65536)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let zeros = vec![0; 65536];
+        for compression in COMPRESSIONS
+            .into_iter()
+            .filter(|c| *c != Compression::None && c.enabled())
+        {
+            for cluster in [4096, 16384] {
+                let options = Options::default()
+                    .compression(compression)
+                    .pcluster_size(cluster);
+                let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+                let mut asynchronous = complete(options.build_async(AsyncOutput::new())).unwrap();
+                let mut flat = Builder::new(Cursor::new(Vec::new())).unwrap();
+                for (kind, data) in [("zero", &zeros), ("random", &random)] {
+                    for size in [4097, 6000, 8191, 8192, 12289, 65535, 65536] {
+                        let name = format!("{kind}-{size}");
+                        append_stream(
+                            &mut sync,
+                            &mut asynchronous,
+                            &name,
+                            &Metadata::default(),
+                            &data[..size],
+                        );
+                        flat.append_file(&name, Metadata::default(), size as u64, &data[..size])
+                            .unwrap();
+                    }
+                }
+                let image = sync.finish().unwrap().into_inner();
+                assert_eq!(image, finish(asynchronous));
+                assert!(image.len() < flat.finish().unwrap().into_inner().len());
+                let fs = crate::EroFS::new(SliceImage::new(&image)).unwrap();
+                let entries = collect_entries(fs.read_dir("/").unwrap());
+                for (kind, data) in [("zero", &zeros), ("random", &random)] {
+                    for size in [4097, 6000, 8191, 8192, 12289, 65535, 65536] {
+                        let name = format!("{kind}-{size}");
+                        assert_eq!(
+                            find_inode(&entries, format!("/{name}")).layout()
+                                == Some(Layout::CompressedCompact),
+                            kind == "zero" && size > 4097
+                        );
+                        assert_eq!(read_all(fs.open(&name).unwrap()), data[..size]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
+    fn compression_fallback_preserves_reusable_metadata_slots() {
+        let mut seed = 7u32;
+        let random: Vec<_> = (0..6500)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let metadata = with_xattrs(xattrs([(b"user.x", b"value")]));
+        for compression in COMPRESSIONS
+            .into_iter()
+            .filter(|c| *c != Compression::None && c.enabled())
+        {
+            for format in [Compact, Extended] {
+                let options = Options::default()
+                    .compression(compression)
+                    .inode_format(format);
+                let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+                let mut asynchronous = complete(options.build_async(AsyncOutput::new())).unwrap();
+                let files = [
+                    ("first", vec![1; 3000]),
+                    ("second", vec![2; 3000]),
+                    ("fallback", random.clone()),
+                    ("reuse", vec![3; 800]),
+                ];
+                for (path, bytes) in &files {
+                    append_stream(&mut sync, &mut asynchronous, path, &metadata, bytes);
+                }
+                let image = sync.finish().unwrap().into_inner();
+                assert_eq!(image, finish(asynchronous));
+                let fs = crate::EroFS::new(SliceImage::new(&image)).unwrap();
+                let entries = collect_entries(fs.read_dir("/").unwrap());
+                let block = |path| find_inode(&entries, path).id() / 128;
+                // The compressed candidate fits first's flushed suffix; its flat
+                // replacement does not. The next file must still reuse that slot.
+                assert_ne!(block("/first"), block("/second"));
+                assert_ne!(block("/first"), block("/fallback"));
+                assert_eq!(block("/first"), block("/reuse"));
+                assert_eq!(
+                    find_inode(&entries, "/fallback").layout(),
+                    Some(crate::types::Layout::FlatInline)
+                );
+                for (path, bytes) in &files {
+                    assert_eq!(read_all(fs.open(path).unwrap()), *bytes);
+                    assert_eq!(fs.xattrs(path).unwrap(), metadata.xattrs);
+                }
+            }
+        }
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
+    fn byte_granular_extents_refill_input_and_compress_eof_tails() {
+        use super::super::compress::{Compressor, Encoder, INPUT_SIZE};
+
+        let mut seed = 7u32;
+        let data: Vec<_> = (0..257_011)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                if i % 6000 < 3000 { seed as u8 } else { 0 }
+            })
+            .collect();
+        let tail = vec![42; 10000];
+        for compression in COMPRESSIONS
+            .into_iter()
+            .filter(|c| *c != Compression::None && c.enabled())
+        {
+            for cluster in [4096, 16384] {
+                let options = Options::default()
+                    .compression(compression)
+                    .pcluster_size(cluster);
+                let metadata = Metadata::default();
+                let mut node = Node::new(&metadata, Content::File, data.len() as u64).unwrap();
+                node.select_format(&options, 1).unwrap();
+                node.compression = compression;
+                node.big_pcluster = cluster > 4096;
+                let mut compressor = Compressor::new(&node, &options);
+                let mut encoder = Encoder::new(&options);
+                let mut edges = vec![0];
+                let mut block = 100;
+                while *edges.last().unwrap() < data.len() {
+                    let at = *edges.last().unwrap();
+                    let end = (at + INPUT_SIZE).min(data.len());
+                    let extent = compressor
+                        .encode(&mut encoder, &data[at..end], block, 0)
+                        .unwrap();
+                    block += (extent.data.len() / 4096) as u32;
+                    edges.push(at + extent.consumed);
+                }
+                assert!(edges[1..edges.len() - 1].iter().any(|at| at % 4096 != 0));
+                assert!((block - 100) as usize * 4096 < data.len() * 3 / 4);
+
+                let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+                let mut asynchronous = complete(options.build_async(AsyncOutput::new())).unwrap();
+                append_stream(&mut sync, &mut asynchronous, "mixed", &metadata, &data);
+                append_stream(&mut sync, &mut asynchronous, "tail", &metadata, &tail);
+                let image = sync.finish().unwrap().into_inner();
+                assert_eq!(image, finish(asynchronous));
+                let source = source(&image);
+                let fs = crate::EroFS::new(&source).unwrap();
+                let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
+                let entries = collect_entries(fs.read_dir("/").unwrap());
+                let inode = find_inode(&entries, "/tail");
+                // EOF is part of the final compressed extent, not a second
+                // physical block containing just 1808 bytes of raw tail data.
+                assert_eq!((&image[inode.id() as usize * 32 + 16..]).get_u32_le(), 1);
+                assert_eq!(read_all(fs.open("tail").unwrap()), tail);
+                let mut file = fs.open("mixed").unwrap();
+                assert_eq!(read_all(&mut file), data);
+                let afile = ready(afs.open("mixed")).unwrap();
+                for edge in edges {
+                    for at in [edge.saturating_sub(1), edge, edge + 1] {
+                        let at = at.min(data.len());
+                        let mut buf = [0; 17];
+                        let n = file.read_at(&mut buf, at as u64).unwrap();
+                        assert_eq!(&buf[..n], &data[at..at + n]);
+                        let n = ready(afile.read_at(&mut buf, at as u64)).unwrap();
+                        assert_eq!(&buf[..n], &data[at..at + n]);
+                    }
+                }
             }
         }
     }
@@ -1171,11 +1441,13 @@ mod r#async {
                     let path = format!("f-{value_len}-{count}");
                     let size = count * 4096 - usize::from(!count.is_multiple_of(2));
                     let data: Vec<_> = (0..size)
-                        .map(|_| {
+                        .map(|i| {
                             random ^= random << 13;
                             random ^= random >> 17;
                             random ^= random << 5;
-                            if count.is_multiple_of(3) {
+                            // Save at least one block so the whole-file cost
+                            // check retains Compact indexes, including PLAINs.
+                            if count.is_multiple_of(3) && i >= 8192 {
                                 random as u8
                             } else {
                                 0
@@ -1448,7 +1720,10 @@ mod r#async {
             .fragments(true)
             .pcluster_size(16384);
         let metadata = Metadata::default();
-        let data = vec![0; 8192 + 4095];
+        // A short zero tail now fits in the same extent. Force a separate
+        // fragment after the maximum decoded extent so packed indexes still
+        // cross page boundaries in this test.
+        let data = vec![0; 65536 + 4095];
         let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
         let mut asynchronous = complete(options.build_async(Cursor::new(Vec::new()))).unwrap();
         for i in 0..1030 {
@@ -1679,7 +1954,7 @@ mod r#async {
                 assert_eq!(fs.super_block().checksum, superblock_checksum(&image));
                 let entries = collect_entries(fs.read_dir("/").unwrap());
                 let inode = find_inode(&entries, "/second");
-                let at = inode.id() as usize * 32 + inode.inode_size as usize;
+                let at = inode.id() as usize * 32 + inode.inode_size;
                 assert_eq!(image[at + 4], if shared { 255 } else { 0 });
             }
         }
@@ -2349,6 +2624,81 @@ mod r#async {
                     &afs.open_inode_file(entry.inode).unwrap(),
                     &[42; 4060],
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_suffixes_are_reused_without_rewriting_existing_contents() {
+        let metadata = with_xattrs(xattrs([(b"user.x", b"value")]));
+        for format in [Compact, Extended] {
+            let options = Options::default().inode_format(format);
+            let mut sync = options.build(Cursor::new(Vec::new())).unwrap();
+            let mut asynchronous = complete(options.build_async(AsyncOutput::new())).unwrap();
+            // Grouped sizes force reuse of pages flushed hundreds of appends ago,
+            // not just reuse of the current page or a small page cache.
+            for (kind, size) in [("big", 2500), ("small", 1200)] {
+                for i in 0..200 {
+                    if kind == "small" {
+                        // Validation failure must not consume a reusable slot.
+                        both!(sync, asynchronous;
+                            append_file("overflow", &metadata, u64::MAX, Unread).await => unwrap_err;
+                        );
+                    }
+                    append_stream(
+                        &mut sync,
+                        &mut asynchronous,
+                        format!("{kind}-{i:03}"),
+                        &metadata,
+                        &vec![i as u8; size],
+                    );
+                }
+            }
+            for i in 0..200 {
+                both!(sync, asynchronous;
+                    append_dir(format!("dir-{i:03}"), Metadata::default()) => unwrap;
+                );
+            }
+            both!(sync, asynchronous;
+                append_hard_link("alias", "big-000") => unwrap;
+            );
+            let image = sync.finish().unwrap().into_inner();
+            assert_eq!(image, finish(asynchronous));
+            assert!(image.len() <= 208 * 4096, "{} bytes", image.len());
+            let source = source(&image);
+            let fs = crate::EroFS::new(&source).unwrap();
+            let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
+            let entries = collect_entries(fs.read_dir("/").unwrap());
+            assert!(
+                find_inode(&entries, "/small-000").id() < find_inode(&entries, "/big-199").id()
+            );
+            assert_eq!(
+                find_inode(&entries, "/big-000").id(),
+                find_inode(&entries, "/alias").id()
+            );
+            assert_eq!(fs.super_block().checksum, superblock_checksum(&image));
+            for (kind, size) in [("big", 2500), ("small", 1200)] {
+                for i in 0..200 {
+                    let name = format!("{kind}-{i:03}");
+                    assert_eq!(fs.xattrs(&name).unwrap(), metadata.xattrs);
+                    assert_eq!(read_all(fs.open(&name).unwrap()), vec![i as u8; size]);
+                    check_read_at(
+                        &fs.open(&name).unwrap(),
+                        &ready(afs.open(&name)).unwrap(),
+                        &vec![i as u8; size],
+                    );
+                }
+            }
+            // Directory metadata must also fill old file-page suffixes.
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.dir_entry.file_type() == DirentFileType::Directory
+                        && e.inode.id() / 128 > 0
+                        && e.inode.id() / 128 <= 200)
+            );
+            for i in 0..200 {
+                assert!(collect_entries(fs.read_dir(format!("dir-{i:03}")).unwrap()).is_empty());
             }
         }
     }

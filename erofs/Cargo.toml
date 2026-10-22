@@ -9,7 +9,7 @@ repository = "https://github.com/Dreamacro/erofs-rs"
 keywords = ["erofs", "filesystem", "readonly", "linux"]
 categories = ["filesystem"]
 readme = "../README.md"
-rust-version = "1.91"
+rust-version = "1.92"
 
 [lints]
 workspace = true
@@ -31,7 +31,7 @@ tokio = ["std", "dep:tokio"]
 lz4 = ["dep:lz4_flex"]
 lzma = ["std", "dep:lzma-rust2"]
 deflate = ["dep:miniz_oxide"]
-zstd = ["dep:ruzstd"]
+zstd = ["std", "dep:zrip"]
 
 [dependencies]
 binrw = { workspace = true }
@@ -44,7 +44,7 @@ memmap2 = { workspace = true, default-features = true, optional = true }
 miniz_oxide = { workspace = true, optional = true }
 opendal = { workspace = true, optional = true }
 rustix = { workspace = true, features = ["fs"] }
-ruzstd = { workspace = true, optional = true, features = ["hash"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["io-util"] }
 typed-path = { workspace = true }
+zrip = { workspace = true, optional = true }

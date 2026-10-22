@@ -12,16 +12,16 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          toolchain: 1.91.0
+          toolchain: 1.92.0
           components: clippy
           rustflags: "-D warnings"
 
       - run: cargo build --workspace --all-targets --all-features --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked
-      - name: Isolated codec features (only lzma enables std)
+      - name: Isolated codec features (lzma and zstd enable std)
         run: |
-          for features in '' lz4 lzma deflate zstd lz4,deflate,zstd; do
+          for features in '' std lz4 std,lz4 lzma deflate std,deflate zstd lz4,deflate lz4,deflate,zstd; do
             cargo test -p erofs-rs --no-default-features --features "$features" --locked
             cargo clippy -p erofs-rs --all-targets --no-default-features --features "$features" --locked -- -D warnings
           done

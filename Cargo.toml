@@ -20,17 +20,17 @@ memmap2 = { version = "0.9", default-features = false }
 miniz_oxide = { version = "0.9", default-features = false }
 opendal = { version = "0.59", default-features = false }
 rustix = { version = "1", default-features = false }
-ruzstd = { version = "0.9", default-features = false }
-tar = { version = "0.4", default-features = false}
+tar = { version = "0.4", default-features = false }
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false }
 typed-path = { version = "0.12", default-features = false }
 url = { version = "2", default-features = false }
 uuid = { version = "1", default-features = false }
+zrip = { version = "0.8", default-features = false, features = ["std", "simd"] }
 
 [profile.release]
 strip = true
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 panic = "abort"
-opt-level = "z"
+opt-level = 3

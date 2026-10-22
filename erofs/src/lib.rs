@@ -1,4 +1,5 @@
-//! A pure Rust library for reading and building EROFS (Enhanced Read-Only File System) images.
+//! A Rust library for reading and building EROFS (Enhanced Read-Only File System) images.
+//! All compression codecs are pure Rust; Zstd reading and writing use zrip.
 //!
 //! EROFS is a read-only filesystem designed for performance and space efficiency,
 //! commonly used in Android and other embedded systems.
@@ -12,7 +13,7 @@
 //!   `Read` sources. `build::AsyncBuilder` uses runtime-independent backend traits
 //!   with shared layout/encoding; the optional `tokio` feature adds `backend::TokioIo`.
 //!   `build::from_directory` is a Unix convenience wrapper.
-//!   Images preserve metadata, inline xattrs and links, with optional Full-index
+//!   Images preserve metadata, inline xattrs and links, with optional Compact-index
 //!   LZ4/MicroLZMA/DEFLATE/Zstd compression for regular files (`std` + the codec feature).
 //! - **Multiple layouts**: Flat plain, flat inline, and chunk-based data layouts
 //! - **Extended attributes**: Inline/shared entries and long name prefixes,
@@ -21,8 +22,8 @@
 //!   Full/Compact indexes, multi-block pclusters, inline tails, packed fragments,
 //!   partial references, and 4/8/16/32-byte extent records. Non-default logical
 //!   clusters and legacy LZ4 trailing padding are supported. Physical clusters are
-//!   limited to 1 MiB encoded / 12 MiB decoded. Only `lzma` requires `std`; the other
-//!   codec features work with `no_std + alloc` on supported targets. Mapping and
+//!   limited to 1 MiB encoded / 12 MiB decoded. `lzma` and `zstd` require `std`;
+//!   `lz4` and `deflate` work with `no_std + alloc` on supported targets. Mapping and
 //!   uncompressed extents do not require codecs. Partial references do not
 //!   necessarily verify unreferenced suffix data or its checksum.
 //!

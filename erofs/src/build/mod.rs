@@ -6,7 +6,10 @@
 //! is a Unix convenience layer. Images use 4 KiB blocks, compact or extended inodes
 //! and flat data, with optional compression for regular files.
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    vec::Vec,
+};
 use std::io;
 use typed_path::UnixPath;
 
@@ -35,12 +38,16 @@ pub use sync::Builder;
 
 /// Regular-file compression. Directories, symlinks and special entries stay flat.
 ///
-/// Compressed files use Compact indexes and a 64 KiB input window,
-/// independently of file size. [`Options::pcluster_size`] bounds
-/// physical clusters (4 KiB by default). Files smaller than 8 KiB retain flat/inline
-/// storage. Unprofitable regions stay PLAIN, with compression-index overhead.
+/// Compressed files use Compact indexes with byte-granular logical extents and
+/// a sliding 64 KiB input window, independently of file size. Prefix fitting is
+/// bounded; it does not guarantee the optimal compression ratio. [`Options::pcluster_size`] bounds
+/// physical clusters (4 KiB by default). Files up to 4 KiB retain flat/inline
+/// storage. Without opt-in tail packing, files up to 64 KiB also fall back to flat
+/// storage when compressed data plus indexes would not save space. Larger
+/// unprofitable regions stay PLAIN, with compression-index overhead.
 /// Inline compressed tails and fragment packing are separately opt-in.
 /// Working memory is bounded by the input window and codec, not by file size.
+/// LZ4, DEFLATE and Zstd encoder allocations are reused across files until the builder is dropped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Compression {
     /// Flat data with inline tails where possible.
@@ -52,7 +59,8 @@ pub enum Compression {
     Lzma,
     /// Raw DEFLATE level 6 with a 32 KiB window, requiring the `deflate` feature.
     Deflate,
-    /// Zstandard (`ruzstd`'s Fastest level) with a 128 KiB window, requiring `zstd`.
+    /// Zstandard level 1 via zrip with a 128 KiB window limit and content checksum.
+    /// Requires the `zstd` feature, which also enables `std`.
     Zstd,
 }
 
@@ -343,10 +351,19 @@ impl SpecialFile {
 // Shared namespace, layout and commit state; neither builder duplicates these rules.
 struct State {
     options: Options,
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    encoder: compress::Encoder,
     nodes: Vec<Node>,
     paths: BTreeMap<Vec<u8>, usize>,
     next_block: u32,
     pending_metadata: Option<MetadataBlock>,
+    // Only suffix addresses are retained, not flushed page contents.
+    metadata_free: BTreeSet<(u64, u32)>,
     fragments: Fragments,
     attributes: encode::Attributes,
     root_reservation: Option<core::ops::Range<u32>>,
@@ -396,6 +413,13 @@ impl State {
     fn new(options: Options) -> Result<Self> {
         options.validate()?;
         Ok(Self {
+            #[cfg(any(
+                feature = "lz4",
+                feature = "lzma",
+                feature = "deflate",
+                feature = "zstd"
+            ))]
+            encoder: compress::Encoder::new(&options),
             options,
             nodes: vec![Node::new(
                 &Metadata {
@@ -411,6 +435,7 @@ impl State {
             paths: BTreeMap::from([(Vec::new(), 0)]),
             next_block: 1,
             pending_metadata: None,
+            metadata_free: BTreeSet::new(),
             fragments: Fragments::default(),
             attributes: encode::Attributes::default(),
             root_reservation: None,
@@ -498,8 +523,7 @@ impl State {
         if self.nodes.len() >= u32::MAX as usize {
             return Err(Error::Overflow("inode count"));
         }
-        node.compression = if matches!(node.content, Content::File) && size >= 2 * BLOCK_SIZE as u64
-        {
+        node.compression = if matches!(node.content, Content::File) && size > BLOCK_SIZE as u64 {
             self.options.compression
         } else {
             Compression::None
@@ -507,20 +531,32 @@ impl State {
         node.big_pcluster = self.options.pcluster_size > BLOCK_SIZE as u32;
         let prefix_count = self.attributes.prefixes.len();
         self.attributes.rewrite(&mut node, &self.options);
-        let inode_size = node.inode_size() + node.xattr_size;
-        let tail = (size % BLOCK_SIZE as u64) as usize;
-        let available = (BLOCK_SIZE - inode_size % BLOCK_SIZE) % BLOCK_SIZE;
-        node.inline_size = if node.compression == Compression::None && tail <= available {
-            tail
+        let next_block = self.allocate_payload(&mut node).inspect_err(|_| {
+            // Recoverable validation must not leave unused global prefixes behind.
+            self.attributes.prefixes.truncate(prefix_count);
+        })?;
+        // Set before I/O, including the first await. Errors or cancellation leave
+        // this set; only a complete payload and its padding can commit the entry.
+        self.poisoned = true;
+        Ok(PendingEntry {
+            path,
+            next_block,
+            node,
+        })
+    }
+
+    // Plan without consuming a free slot; only commit_payload changes the free list.
+    fn allocate_payload(&self, node: &mut Node) -> Result<u32> {
+        node.inline_size = if node.compression == Compression::None {
+            node.flat_inline_size()
         } else {
             0
         };
-        let record_size = node.metadata_end().next_multiple_of(INODE_SLOT_SIZE as u64);
+        let record_size = node.record_size();
         let mut data_block = u64::from(self.next_block);
-        let inode_offset = if let Some(page) = &self.pending_metadata
-            && page.used as u64 + record_size <= BLOCK_SIZE as u64
-        {
-            u64::from(page.block) * BLOCK_SIZE as u64 + page.used as u64
+        let slot = self.metadata_free.range((record_size, 0)..).next().copied();
+        let inode_offset = if let Some((free, block)) = slot {
+            (u64::from(block) + 1) * BLOCK_SIZE as u64 - free
         } else {
             // Reserve the contiguous inode/xattr blocks before external data.
             data_block += record_size.div_ceil(BLOCK_SIZE as u64);
@@ -530,11 +566,7 @@ impl State {
         // Validate even the incompressible case before consuming input. Compressed
         // data starts after reserved indexes; actual blocks are counted as written.
         let plain_end = u32::try_from(data_block + external_size.div_ceil(BLOCK_SIZE as u64))
-            .map_err(|_| Error::Overflow("file block count"))
-            .inspect_err(|_| {
-                // Recoverable validation must not leave unused global prefixes behind.
-                self.attributes.prefixes.truncate(prefix_count);
-            })?;
+            .map_err(|_| Error::Overflow("file block count"))?;
         let next_block = if node.compression != Compression::None {
             data_block as u32
         } else {
@@ -546,18 +578,57 @@ impl State {
             data_block as u32
         };
         node.nid = inode_offset / INODE_SLOT_SIZE as u64;
-        // Set before I/O, including the first await. Errors or cancellation leave
-        // this set; only a complete payload and its padding can commit the entry.
-        self.poisoned = true;
-        Ok(PendingEntry {
-            path,
-            next_block,
-            node,
-        })
+        Ok(next_block)
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    fn buffered_file_size(&self, node: &Node) -> Option<usize> {
+        (node.compression != Compression::None
+            && node.size <= compress::INPUT_SIZE as u64
+            && !self.options.inline_compressed_tails
+            && !self.options.fragments)
+            .then_some(node.size as usize)
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    fn buffer_file(
+        &mut self,
+        entry: &mut PendingEntry,
+        input: &[u8],
+    ) -> Result<Option<compress::BufferedFile>> {
+        let encoded = compress::Compressor::new(&entry.node, &self.options).encode_file(
+            &mut self.encoder,
+            input,
+            entry.next_block,
+        )?;
+        let node = &entry.node;
+        let inline = node.flat_inline_size();
+        let flat_cost = (node.size - inline as u64).next_multiple_of(BLOCK_SIZE as u64)
+            + (node.inode_size() + node.xattr_size + inline).next_multiple_of(INODE_SLOT_SIZE)
+                as u64;
+        let compressed_cost = encoded.data.len() as u64 + node.record_size();
+        if compressed_cost < flat_cost {
+            return Ok(Some(encoded));
+        }
+        // Neither layout owns a slot until commit, so fallback needs no rollback.
+        entry.node.compression = Compression::None;
+        entry.next_block = self.allocate_payload(&mut entry.node)?;
+        Ok(None)
     }
 
     // Keep one page pending; the driver writes the displaced page before continuing.
-    fn start_metadata_block(&mut self, block: u32) -> Option<MetadataBlock> {
+    fn start_metadata_block(&mut self, offset: u64) -> Option<MetadataBlock> {
+        let block = (offset / BLOCK_SIZE as u64) as u32;
         if self
             .pending_metadata
             .as_ref()
@@ -565,13 +636,15 @@ impl State {
         {
             None
         } else {
-            self.pending_metadata.replace(MetadataBlock::new(block))
+            self.pending_metadata
+                .replace(MetadataBlock::from_offset(offset))
         }
     }
 
     fn prepare_metadata(&mut self, node: &Node) -> impl Iterator<Item = MetadataBlock> {
         node.header_blocks().filter_map(move |block| {
-            let previous = self.start_metadata_block(block);
+            let offset = (u64::from(block) * BLOCK_SIZE as u64).max(node.inode_offset());
+            let previous = self.start_metadata_block(offset);
             self.pending_metadata
                 .as_mut()
                 .unwrap()
@@ -601,7 +674,8 @@ impl State {
             (offset + bytes.len() as u64).div_ceil(BLOCK_SIZE as u64)
         };
         (start..end).filter_map(move |block| {
-            let previous = self.start_metadata_block(block as u32);
+            let start = (block * BLOCK_SIZE as u64).max(node.inode_offset());
+            let previous = self.start_metadata_block(start);
             let page = self.pending_metadata.as_mut().unwrap();
             page.write_inode(node, self.nodes.len());
             page.write_at(offset, bytes);
@@ -610,6 +684,20 @@ impl State {
     }
 
     fn commit_payload(&mut self, mut entry: PendingEntry) {
+        if entry.node.metadata_block() < self.next_block {
+            let slot = (
+                BLOCK_SIZE as u64 - entry.node.inode_offset() % BLOCK_SIZE as u64,
+                entry.node.metadata_block(),
+            );
+            let removed = self.metadata_free.remove(&slot);
+            debug_assert!(
+                removed,
+                "committed metadata must occupy its planned free slot"
+            );
+        }
+        if let Some(gap) = entry.node.metadata_gap() {
+            self.metadata_free.insert(gap);
+        }
         self.attributes.remember(&entry.node, &self.options);
         entry.node.xattrs = Vec::new();
         self.insert(entry.path, entry.node);
@@ -707,10 +795,8 @@ impl State {
     }
 
     fn allocate_directories(&mut self) -> Result<()> {
-        // Use block-zero slack unless a large root has already reserved its space.
-        // Other directory records are allocated after the payloads.
-        let mut metadata_block = 0;
-        let mut used = self.options.root_offset();
+        // Keep the root in block zero when possible; all other directories
+        // share the same best-fit suffix allocator as streamed file records.
         for (node_index, node) in self.nodes.iter_mut().enumerate() {
             if !matches!(node.content, Content::Directory { .. }) {
                 continue;
@@ -734,18 +820,29 @@ impl State {
             let tail = (node.size % BLOCK_SIZE as u64) as usize;
             node.inline_size = if tail <= available { tail } else { 0 };
             let record_size = (inode_size + node.inline_size).next_multiple_of(INODE_SLOT_SIZE);
-            if let Some(reservation) = reservation {
-                metadata_block = reservation.start;
-                used = prefix;
-            } else if used + record_size > BLOCK_SIZE {
-                metadata_block = self.next_block;
+            let slot = if node_index == 0 {
+                None
+            } else {
+                self.metadata_free
+                    .range((record_size as u64, 0)..)
+                    .next()
+                    .copied()
+            };
+            let inode_offset = if let Some(reservation) = reservation {
+                u64::from(reservation.start) * BLOCK_SIZE as u64 + prefix as u64
+            } else if node_index == 0 && self.options.root_offset() + record_size <= BLOCK_SIZE {
+                self.options.root_offset() as u64
+            } else if let Some((free, block)) = slot {
+                self.metadata_free.remove(&(free, block));
+                (u64::from(block) + 1) * BLOCK_SIZE as u64 - free
+            } else {
+                let start = self.next_block;
                 self.next_block = self
                     .next_block
                     .checked_add(record_size.div_ceil(BLOCK_SIZE) as u32)
                     .ok_or(Error::Overflow("image block count"))?;
-                used = 0;
-            }
-            let inode_offset = u64::from(metadata_block) * BLOCK_SIZE as u64 + used as u64;
+                u64::from(start) * BLOCK_SIZE as u64
+            };
             node.nid = inode_offset / INODE_SLOT_SIZE as u64;
             if let Some(reservation) = reservation
                 && self.next_block == reservation.end
@@ -757,8 +854,9 @@ impl State {
                 self.next_block = end;
             }
             self.attributes.remember(node, &self.options);
-            metadata_block = node.last_metadata_block();
-            used = ((inode_offset + record_size as u64 - 1) % BLOCK_SIZE as u64 + 1) as usize;
+            if let Some(gap) = node.metadata_gap() {
+                self.metadata_free.insert(gap);
+            }
             let external_size = node.external_size();
             node.data_block = if external_size == 0 {
                 0

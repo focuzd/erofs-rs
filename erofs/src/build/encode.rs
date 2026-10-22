@@ -212,31 +212,45 @@ impl Attributes {
         Ok(())
     }
 
-    pub fn blocks(&self) -> impl Iterator<Item = (u64, [u8; BLOCK_SIZE])> {
+    pub fn blocks(&self) -> impl Iterator<Item = MetadataBlock> {
         self.table.chunks(BLOCK_SIZE).enumerate().map(|(i, bytes)| {
             let mut block = ZERO_BLOCK;
             block[..bytes.len()].copy_from_slice(bytes);
-            (
-                (u64::from(self.table_block) + i as u64) * BLOCK_SIZE as u64,
-                block,
-            )
+            MetadataBlock {
+                block: self.table_block + i as u32,
+                start: 0,
+                data: block,
+            }
         })
     }
 }
 
 pub(super) struct MetadataBlock {
     pub block: u32,
-    pub used: usize,
+    // Reopened pages contain only this suffix; preserve the on-disk prefix.
+    start: usize,
     pub data: [u8; BLOCK_SIZE],
 }
 
 impl MetadataBlock {
     pub fn new(block: u32) -> Self {
+        Self::from_offset(u64::from(block) * BLOCK_SIZE as u64)
+    }
+
+    pub fn from_offset(offset: u64) -> Self {
         Self {
-            block,
-            used: 0,
+            block: (offset / BLOCK_SIZE as u64) as u32,
+            start: (offset % BLOCK_SIZE as u64) as usize,
             data: ZERO_BLOCK,
         }
+    }
+
+    pub fn offset(&self) -> u64 {
+        u64::from(self.block) * BLOCK_SIZE as u64 + self.start as u64
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.data[self.start..]
     }
 
     pub fn inline_data_mut(&mut self, node: &Node) -> &mut [u8] {
@@ -254,10 +268,6 @@ impl MetadataBlock {
         if node.compression != Compression::None {
             self.write_at(node.map_offset(), &node.map_header());
         }
-        let end = node.metadata_end();
-        self.used = ((end - u64::from(self.block) * BLOCK_SIZE as u64).min(BLOCK_SIZE as u64)
-            as usize)
-            .next_multiple_of(INODE_SLOT_SIZE);
     }
 
     pub fn write_at(&mut self, offset: u64, data: &[u8]) {
@@ -265,6 +275,10 @@ impl MetadataBlock {
         let skip = base.saturating_sub(offset).min(data.len() as u64) as usize;
         let start = offset.saturating_sub(base).min(BLOCK_SIZE as u64) as usize;
         let len = (BLOCK_SIZE - start).min(data.len() - skip);
+        debug_assert!(
+            len == 0 || start >= self.start,
+            "cannot rewrite a flushed prefix"
+        );
         self.data[start..start + len].copy_from_slice(&data[skip..skip + len]);
     }
 }
@@ -299,8 +313,7 @@ impl Content {
 
 // NIDs address 32-byte slots, including variable-sized inline records. No source
 // handles or per-file tail buffers are retained; only one metadata block is pending.
-// ponytail: multi-block records start fresh, leaving up to one block of slack;
-// pack continuation pages only if large-xattr workloads warrant it.
+// Multi-page records reserve contiguous blocks; their final suffix is reusable.
 pub(super) struct Node {
     pub metadata: Metadata,
     pub content: Content,
@@ -454,6 +467,23 @@ impl Node {
         ((self.metadata_end() - 1) / BLOCK_SIZE as u64) as u32
     }
 
+    pub fn flat_inline_size(&self) -> usize {
+        let tail = (self.size % BLOCK_SIZE as u64) as usize;
+        let available =
+            (BLOCK_SIZE - (self.inode_size() + self.xattr_size) % BLOCK_SIZE) % BLOCK_SIZE;
+        if tail <= available { tail } else { 0 }
+    }
+
+    pub fn record_size(&self) -> u64 {
+        (self.metadata_end() - self.inode_offset()).next_multiple_of(INODE_SLOT_SIZE as u64)
+    }
+
+    pub fn metadata_gap(&self) -> Option<(u64, u32)> {
+        let end = self.metadata_end().next_multiple_of(INODE_SLOT_SIZE as u64);
+        let free = (BLOCK_SIZE as u64 - end % BLOCK_SIZE as u64) % BLOCK_SIZE as u64;
+        (free != 0).then_some((free, self.last_metadata_block()))
+    }
+
     /// Write headers/attributes now; indexes and inline data follow incrementally.
     pub fn header_blocks(&self) -> core::ops::RangeInclusive<u32> {
         let last = if self.compression != Compression::None {
@@ -589,7 +619,7 @@ pub(super) fn inode(node: &Node, node_index: usize) -> [u8; InodeExtended::size(
 pub(super) fn metadata_blocks(
     nodes: &[Node],
     attributes: &Attributes,
-) -> impl Iterator<Item = (u64, [u8; BLOCK_SIZE])> {
+) -> impl Iterator<Item = MetadataBlock> {
     directory_data_blocks(nodes)
         .chain(directory_inode_blocks(nodes))
         .chain(packed_inode_blocks(nodes, attributes))
@@ -599,7 +629,7 @@ pub(super) fn metadata_blocks(
 fn packed_inode_blocks(
     nodes: &[Node],
     attributes: &Attributes,
-) -> impl Iterator<Item = (u64, [u8; BLOCK_SIZE])> {
+) -> impl Iterator<Item = MetadataBlock> {
     nodes
         .iter()
         .enumerate()
@@ -621,12 +651,12 @@ fn packed_inode_blocks(
                 {
                     page.write_at(at, &blocks.next().unwrap().to_le_bytes());
                 }
-                (base, page.data)
+                page
             })
         })
 }
 
-fn directory_data_blocks(nodes: &[Node]) -> impl Iterator<Item = (u64, [u8; BLOCK_SIZE])> {
+fn directory_data_blocks(nodes: &[Node]) -> impl Iterator<Item = MetadataBlock> {
     nodes
         .iter()
         .filter_map(|node| match &node.content {
@@ -638,46 +668,61 @@ fn directory_data_blocks(nodes: &[Node]) -> impl Iterator<Item = (u64, [u8; BLOC
             directory_blocks(entries)
                 .take(blocks as usize)
                 .enumerate()
-                .map(move |(index, entries)| {
-                    (
-                        (u64::from(node.data_block) + index as u64) * BLOCK_SIZE as u64,
-                        directory_block(entries, nodes),
-                    )
+                .map(move |(index, entries)| MetadataBlock {
+                    block: node.data_block + index as u32,
+                    start: 0,
+                    data: directory_block(entries, nodes),
                 })
         })
 }
 
-fn directory_inode_blocks(nodes: &[Node]) -> impl Iterator<Item = (u64, [u8; BLOCK_SIZE])> {
-    // Directory records are ordered; an attribute body may span several blocks.
-    let mut inodes = nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, node)| matches!(node.content, Content::Directory { .. }))
-        .peekable();
-    let mut next_block = 0;
-    core::iter::from_fn(move || {
-        let block = next_block.max(inodes.peek()?.1.metadata_block());
-        let mut page = MetadataBlock::new(block);
-        while let Some(&(node_index, node)) = inodes.peek() {
-            if node.metadata_block() > block {
-                break;
-            }
-            page.write_inode(node, node_index);
-            if node.last_metadata_block() != block {
-                break;
-            }
-            if let Content::Directory { entries, .. } = &node.content
-                && node.inline_size != 0
-            {
-                let tail = directory_block(directory_blocks(entries).last().unwrap(), nodes);
-                page.inline_data_mut(node)
-                    .copy_from_slice(&tail[..node.inline_size]);
-            }
-            inodes.next();
+fn directory_inode_blocks(nodes: &[Node]) -> impl Iterator<Item = MetadataBlock> {
+    // Directories can occupy old file-page suffixes, so NIDs need not increase.
+    // Write in allocation order: later records in a page always follow earlier
+    // ones. Only block zero must be assembled in full for the superblock CRC.
+    let directories = || {
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.content, Content::Directory { .. }))
+    };
+    let write = move |page: &mut MetadataBlock, index, node: &Node| {
+        page.write_inode(node, index);
+        if page.block == node.last_metadata_block()
+            && node.inline_size != 0
+            && let Content::Directory { entries, .. } = &node.content
+        {
+            let tail = directory_block(directory_blocks(entries).last().unwrap(), nodes);
+            page.inline_data_mut(node)
+                .copy_from_slice(&tail[..node.inline_size]);
         }
-        next_block = block + 1;
-        Some((u64::from(block) * BLOCK_SIZE as u64, page.data))
-    })
+    };
+    let mut first = None;
+    for (index, node) in directories().filter(|(_, n)| n.metadata_block() == 0) {
+        write(
+            first.get_or_insert_with(|| MetadataBlock::new(0)),
+            index,
+            node,
+        );
+    }
+    first.into_iter().chain(
+        directories()
+            .filter(|(_, n)| n.metadata_block() != 0)
+            .flat_map(move |(index, node)| {
+                (node.metadata_block()..=node.last_metadata_block()).map(move |block| {
+                    let base = u64::from(block) * BLOCK_SIZE as u64;
+                    // A reserved root's Compact-header prefix is not shared.
+                    let offset = if index == 0 {
+                        base
+                    } else {
+                        base.max(node.inode_offset())
+                    };
+                    let mut page = MetadataBlock::from_offset(offset);
+                    write(&mut page, index, node);
+                    page
+                })
+            }),
+    )
 }
 
 pub(super) fn padding(size: u64) -> &'static [u8] {

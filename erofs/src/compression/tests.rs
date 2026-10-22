@@ -673,6 +673,200 @@ fn zstd_checks_checksum_window_descriptor_and_content_size() {
         ));
     }
     assert!(decode_zstd(&[sample, sample].concat(), &mut output, 1 << 20, false).is_err());
+    for cut in 0..sample.len() {
+        assert!(decode_zstd(&sample[..cut], &mut output, 1 << 20, false).is_err());
+    }
+    // Same frame, but with an explicit 2304-byte window (including its mantissa).
+    // The declared window must respect the EROFS limit before decoding.
+    let explicit_window = [&sample[..4], &[0x44, 9], &sample[5..]].concat();
+    // No content size; the explicit window is 2048 bytes.
+    let unknown_size = [&sample[..4], &[4, 8], &sample[7..]].concat();
+    for (frame, window, too_small) in [
+        (sample, 2048, 1024),
+        (explicit_window.as_slice(), 4096, 2048),
+        (unknown_size.as_slice(), 2048, 1024),
+    ] {
+        decode_zstd(frame, &mut output, window, false).unwrap();
+        assert_eq!(output, expected());
+        for size in [1, 700, 1025] {
+            let mut prefix = vec![0; size];
+            decode_zstd(frame, &mut prefix, window, true).unwrap();
+            assert_eq!(prefix, expected()[..size]);
+            for partial in [false, true] {
+                assert!(decode_zstd(frame, &mut prefix, too_small, partial).is_err());
+            }
+        }
+        for size in [1024, 1026] {
+            assert!(decode_zstd(frame, &mut vec![0; size], window, false).is_err());
+        }
+        // An unreferenced checksum need not be available for a partial extent.
+        let mut prefix = [0; 700];
+        decode_zstd(&frame[..frame.len() - 4], &mut prefix, window, true).unwrap();
+        assert_eq!(prefix, [b'A'; 700]);
+        let mut bad_checksum = frame.to_vec();
+        *bad_checksum.last_mut().unwrap() ^= 1;
+        assert!(decode_zstd(&bad_checksum, &mut output, window, false).is_err());
+        assert!(decode_zstd(&[frame, &[0]].concat(), &mut output, window, false).is_err());
+    }
+    // Single-segment sizes must not allocate huge history or accept reserved
+    // content sizes, even when only one output byte is requested.
+    for size in [1u64 << 40, u64::MAX - 1, u64::MAX] {
+        let oversized = [&sample[..4], &[0xe0], &size.to_le_bytes()].concat();
+        for partial in [false, true] {
+            assert!(decode_zstd(&oversized, &mut [0], 1 << 20, partial).is_err());
+        }
+    }
+    // An explicitly encoded UNKNOWN sentinel is not an omitted content size.
+    let sentinel = [
+        &sample[..4],
+        &[0xc4, 8],
+        &u64::MAX.to_le_bytes(),
+        &sample[7..],
+    ]
+    .concat();
+    for partial in [false, true] {
+        assert!(decode_zstd(&sentinel, &mut output, 2048, partial).is_err());
+    }
+    // A skippable frame is not an EROFS compressed data frame, even for no output.
+    let skippable = [0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0];
+    for partial in [false, true] {
+        assert!(decode_zstd(&skippable, &mut [], 1024, partial).is_err());
+    }
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_single_frame_boundaries_and_multiblock_prefixes() {
+    // Unknown content size, 1 KiB window, five independently encoded RLE blocks.
+    let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0, 0];
+    let mut wanted = Vec::new();
+    for i in 0..5 {
+        let block = (1024u32 << 3) | 2 | u32::from(i == 4);
+        frame.extend_from_slice(&block.to_le_bytes()[..3]);
+        frame.push(b'A' + i);
+        wanted.extend_from_slice(&[b'A' + i; 1024]);
+    }
+    let mut output = vec![0; wanted.len()];
+    decode_zstd(&frame, &mut output, 1024, false).unwrap();
+    assert_eq!(output, wanted);
+    for (size, available) in [(1, 10), (1024, 10), (1537, 14), (5120, frame.len())] {
+        let mut prefix = vec![0; size];
+        decode_zstd(&frame[..available], &mut prefix, 1024, true).unwrap();
+        assert_eq!(prefix, wanted[..size]);
+        if available != frame.len() {
+            assert!(decode_zstd(&frame[..available], &mut prefix, 1024, false).is_err());
+        }
+    }
+    // A partial reference must not parse an unreferenced, corrupt suffix.
+    let mut corrupt_suffix = frame[..10].to_vec();
+    corrupt_suffix.extend_from_slice(&[7, 0, 0]); // Reserved block type.
+    let mut prefix = [0; 1024];
+    decode_zstd(&corrupt_suffix, &mut prefix, 1024, true).unwrap();
+    assert_eq!(prefix, [b'A'; 1024]);
+    for partial in [false, true] {
+        assert!(decode_zstd(&corrupt_suffix, &mut [0; 1025], 1024, partial).is_err());
+    }
+
+    // Block limits still apply to the referenced prefix, not only full frames.
+    for kind in [0, 1, 2, 3] {
+        let mut oversized = frame[..6].to_vec();
+        let header = (1025u32 << 3) | (kind << 1) | 1;
+        oversized.extend_from_slice(&header.to_le_bytes()[..3]);
+        oversized.extend_from_slice(&[b'A'; 1025]);
+        for partial in [false, true] {
+            assert!(decode_zstd(&oversized, &mut [0], 1024, partial).is_err());
+        }
+    }
+    // Encoded size fits the window, but the compressed block expands to 1025 bytes.
+    let (_, _, sample) = samples().into_iter().find(|s| s.0 == 3).unwrap();
+    let oversized = [&sample[..4], &[0, 0], &sample[7..sample.len() - 4]].concat();
+    assert!(decode_zstd(&oversized, &mut [0; 1025], 1024, false).is_err());
+    assert!(decode_zstd(&oversized, &mut [0], 1024, true).is_err());
+
+    for id in [0, 42] {
+        let dictionary = [&sample[..4], &[0x65, id], &sample[5..]].concat();
+        let result = decode_zstd(&dictionary, &mut [0; 1025], 2048, false);
+        assert_eq!(result.is_ok(), id == 0);
+        // Reject dictionary-dependent frames even when no data is requested.
+        assert_eq!(
+            decode_zstd(&dictionary, &mut [], 2048, true).is_ok(),
+            id == 0
+        );
+    }
+
+    let empty = zrip::compress(&[], 1).unwrap();
+    decode_zstd(&empty, &mut [], 1024, false).unwrap();
+    let skippable = [0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0];
+    for suffix in [empty.as_slice(), &skippable, frame.as_slice()] {
+        let joined = [frame.as_slice(), suffix].concat();
+        assert!(decode_zstd(&joined, &mut output, 1024, false).is_err());
+        // Never continue a partial reference into a second frame.
+        let mut too_long = vec![0; wanted.len() + 1];
+        assert!(decode_zstd(&joined, &mut too_long, 1024, true).is_err());
+        decode_zstd(&joined, &mut output, 1024, true).unwrap();
+        assert_eq!(output, wanted);
+    }
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_mixed_blocks_and_empty_end() {
+    let (_, _, sample) = samples().into_iter().find(|s| s.0 == 3).unwrap();
+    // Unknown size, 2 KiB window, empty/raw/compressed/empty/RLE/empty blocks.
+    let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0, 8, 0, 0, 0, 32, 0, 0];
+    frame.extend_from_slice(b"head");
+    let at = frame.len();
+    frame.extend_from_slice(&sample[7..sample.len() - 4]);
+    frame[at] &= !1;
+    frame.extend_from_slice(&[0, 0, 0, 58, 0, 0, b'!', 1, 0, 0]);
+    let wanted = [b"head", expected().as_slice(), b"!!!!!!!"].concat();
+    let mut output = vec![0; wanted.len()];
+    decode_zstd(&frame, &mut output, 2048, false).unwrap();
+    assert_eq!(output, wanted);
+    for size in [0, 1, 4, 5, 1024, 1029, 1030, wanted.len()] {
+        let mut prefix = vec![0; size];
+        decode_zstd(&frame, &mut prefix, 2048, true).unwrap();
+        assert_eq!(prefix, wanted[..size]);
+    }
+    for cut in 1..=3 {
+        let truncated = &frame[..frame.len() - cut];
+        assert!(decode_zstd(truncated, &mut output, 2048, false).is_err());
+        decode_zstd(truncated, &mut output, 2048, true).unwrap();
+        assert_eq!(output, wanted);
+    }
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_native_multiblock_frame_preserves_history() {
+    // Native libzstd level 3, windowLog=17, checksum enabled; four dependent blocks.
+    let frame = [
+        40, 181, 47, 253, 132, 56, 0, 64, 6, 0, 12, 1, 0, 200, 90, 115, 116, 100, 32, 109, 117,
+        108, 116, 105, 45, 98, 108, 111, 99, 107, 32, 104, 105, 115, 116, 111, 114, 121, 10, 1, 0,
+        145, 255, 115, 62, 199, 84, 0, 0, 16, 114, 121, 1, 0, 251, 255, 57, 192, 2, 84, 0, 0, 16,
+        115, 116, 1, 0, 251, 255, 57, 192, 2, 69, 0, 0, 8, 32, 1, 0, 252, 159, 7, 66, 68, 253, 149,
+        59,
+    ];
+    let wanted = b"Zstd multi-block history\n".repeat(16384);
+    let mut output = vec![0; wanted.len()];
+    decode_zstd(&frame, &mut output, 1 << 17, false).unwrap();
+    assert_eq!(output, wanted);
+    for (size, available) in [
+        (1, 46),
+        (131072, 46),
+        (131073, 59),
+        (262144, 59),
+        (262145, 72),
+        (393217, 83),
+        (wanted.len(), 83),
+    ] {
+        let mut prefix = vec![0; size];
+        decode_zstd(&frame[..available], &mut prefix, 1 << 17, true).unwrap();
+        assert_eq!(prefix, wanted[..size]);
+    }
+    for cut in 0..frame.len() {
+        assert!(decode_zstd(&frame[..cut], &mut output, 1 << 17, false).is_err());
+    }
 }
 
 #[test]

@@ -179,7 +179,7 @@ inside the image.
 - `lz4`: Enables LZ4 decoding via `lz4_flex` without requiring `std`; with `std`, also enables LZ4 image writing
 - `lzma`: Enables EROFS MicroLZMA reading and writing via `lzma-rust2`; implies `std`
 - `deflate`: Enables raw DEFLATE decoding via `miniz_oxide`, without requiring `std`; with `std`, also enables writing
-- `zstd`: Enables Zstd decoding via `ruzstd`, without requiring `std`; with `std`, also enables writing
+- `zstd`: Enables Zstd reading and writing via `zrip`; implies `std`. Each builder owns and reuses its encoder, preserving `Send` futures
 - All four codec features are enabled in the CLI
 - Without `std`: Operates in `no_std` mode with `alloc`
 

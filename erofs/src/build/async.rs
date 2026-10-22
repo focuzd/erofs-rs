@@ -161,11 +161,11 @@ impl<W: AsyncWrite + AsyncSeek> AsyncBuilder<W> {
         self.flush_metadata().await?;
         self.flush_fragments().await?;
         let mut superblock = encode::superblock(&self.state, blocks);
-        for (offset, block) in encode::metadata_blocks(&self.state.nodes, &self.state.attributes) {
-            if offset == 0 {
-                encode::set_superblock_checksum(&mut superblock, &block);
+        for page in encode::metadata_blocks(&self.state.nodes, &self.state.attributes) {
+            if page.block == 0 {
+                encode::set_superblock_checksum(&mut superblock, &page.data);
             }
-            write_at(&mut self.output, offset, &block).await?;
+            write_at(&mut self.output, page.offset(), page.bytes()).await?;
         }
         for (node_index, node) in self.state.nodes.iter().enumerate() {
             if node.nlink > 1 && !matches!(node.content, Content::Directory { .. }) {
@@ -197,6 +197,23 @@ impl<W: AsyncWrite + AsyncSeek> AsyncBuilder<W> {
         let entry = self
             .state
             .prepare_payload(path, metadata, content, size, 1)?;
+        #[cfg(any(
+            feature = "lz4",
+            feature = "lzma",
+            feature = "deflate",
+            feature = "zstd"
+        ))]
+        if let Some(size) = self.state.buffered_file_size(&entry.node) {
+            let mut entry = entry;
+            let mut input = vec![0; size];
+            read_exact(&mut data, &mut input).await?;
+            let encoded = self.state.buffer_file(&mut entry, &input)?;
+            self.prepare_metadata(&entry.node).await?;
+            if let Some(encoded) = encoded {
+                return self.append_buffered(entry, encoded).await;
+            }
+            return self.append_flat(entry, &mut input.as_slice()).await;
+        }
         self.prepare_metadata(&entry.node).await?;
         #[cfg(any(
             feature = "lz4",
@@ -207,6 +224,14 @@ impl<W: AsyncWrite + AsyncSeek> AsyncBuilder<W> {
         if entry.node.compression != super::Compression::None {
             return self.append_compressed(entry, &mut data).await;
         }
+        self.append_flat(entry, &mut data).await
+    }
+
+    async fn append_flat(
+        &mut self,
+        entry: super::PendingEntry,
+        data: &mut impl AsyncRead,
+    ) -> Result<()> {
         let external_size = entry.node.external_size();
         if external_size != 0 {
             self.output
@@ -214,13 +239,51 @@ impl<W: AsyncWrite + AsyncSeek> AsyncBuilder<W> {
                     u64::from(entry.node.data_block) * BLOCK_SIZE as u64,
                 ))
                 .await?;
-            copy_exact(&mut data, &mut self.output, external_size).await?;
+            copy_exact(data, &mut self.output, external_size).await?;
             self.output
                 .write_all(encode::padding(external_size))
                 .await?;
         }
         let page = self.state.pending_metadata.as_mut().unwrap();
-        read_exact(&mut data, page.inline_data_mut(&entry.node)).await?;
+        read_exact(data, page.inline_data_mut(&entry.node)).await?;
+        self.state.commit_payload(entry);
+        Ok(())
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    async fn append_buffered(
+        &mut self,
+        mut entry: super::PendingEntry,
+        encoded: super::compress::BufferedFile,
+    ) -> Result<()> {
+        self.output
+            .seek(SeekFrom::Start(
+                u64::from(entry.next_block) * BLOCK_SIZE as u64,
+            ))
+            .await?;
+        self.output.write_all(&encoded.data).await?;
+        let blocks = (encoded.data.len() / BLOCK_SIZE) as u32;
+        entry.next_block += blocks;
+        entry.node.data_block = blocks;
+        for page in
+            self.state
+                .write_indexes(&entry.node, entry.node.index_offset(), &encoded.indexes)
+        {
+            write_at(&mut self.output, page.offset(), page.bytes()).await?;
+        }
+        if entry.node.metadata_block() != self.state.pending_metadata.as_ref().unwrap().block {
+            write_at(
+                &mut self.output,
+                entry.node.inode_offset(),
+                &encode::inode(&entry.node, self.state.nodes.len())[..entry.node.inode_size()],
+            )
+            .await?;
+        }
         self.state.commit_payload(entry);
         Ok(())
     }
@@ -247,57 +310,56 @@ impl<W: AsyncWrite + AsyncSeek> AsyncBuilder<W> {
                 u64::from(entry.next_block) * BLOCK_SIZE as u64,
             ))
             .await?;
-        while remaining != 0 {
-            let len = remaining.min(input.len() as u64) as usize;
-            read_exact(data, &mut input[..len]).await?;
+        let mut buffered = 0;
+        while remaining != 0 || buffered != 0 {
+            let len = remaining.min((input.len() - buffered) as u64) as usize;
+            read_exact(data, &mut input[buffered..buffered + len]).await?;
             remaining -= len as u64;
-            let mut input = &input[..len];
-            while !input.is_empty() {
-                let consumed =
-                    compressor.encode(input, entry.next_block, self.state.fragments.size)?;
-                match compressor.placement {
-                    Placement::Inline => entry.node.inline_size = compressor.data.len(),
-                    Placement::Fragment => {
-                        let mut tail = &compressor.data[..];
-                        while !tail.is_empty() {
-                            let n = self.state.fragments.append(&mut entry, tail);
-                            tail = &tail[n..];
-                            if self.state.fragments.used == BLOCK_SIZE {
-                                self.flush_fragments().await?;
-                            }
+            buffered += len;
+            let extent = compressor.encode(
+                &mut self.state.encoder,
+                &input[..buffered],
+                entry.next_block,
+                self.state.fragments.size,
+            )?;
+            match extent.placement {
+                Placement::Inline => entry.node.inline_size = extent.data.len(),
+                Placement::Fragment => {
+                    let mut tail = extent.data;
+                    while !tail.is_empty() {
+                        let n = self.state.fragments.append(&mut entry, tail);
+                        tail = &tail[n..];
+                        if self.state.fragments.used == BLOCK_SIZE {
+                            self.flush_fragments().await?;
                         }
                     }
-                    Placement::External => {
-                        self.output.write_all(&compressor.data).await?;
-                        let blocks = (compressor.data.len() / BLOCK_SIZE) as u32;
-                        entry.next_block += blocks; // Worst-case bounds checked before I/O.
-                        entry.node.data_block += blocks;
-                    }
                 }
-                for page in self
-                    .state
-                    .write_indexes(&entry.node, index_offset, &compressor.indexes)
-                {
-                    write_at(
-                        &mut self.output,
-                        u64::from(page.block) * BLOCK_SIZE as u64,
-                        &page.data,
-                    )
-                    .await?;
-                    self.output
-                        .seek(SeekFrom::Start(
-                            u64::from(entry.next_block) * BLOCK_SIZE as u64,
-                        ))
-                        .await?;
+                Placement::External => {
+                    self.output.write_all(extent.data).await?;
+                    let blocks = (extent.data.len() / BLOCK_SIZE) as u32;
+                    entry.next_block += blocks; // Worst-case bounds checked before I/O.
+                    entry.node.data_block += blocks;
                 }
-                index_offset += compressor.indexes.len() as u64;
-                input = &input[consumed..];
             }
+            for page in self
+                .state
+                .write_indexes(&entry.node, index_offset, extent.indexes)
+            {
+                write_at(&mut self.output, page.offset(), page.bytes()).await?;
+                self.output
+                    .seek(SeekFrom::Start(
+                        u64::from(entry.next_block) * BLOCK_SIZE as u64,
+                    ))
+                    .await?;
+            }
+            index_offset += extent.indexes.len() as u64;
+            input.copy_within(extent.consumed..buffered, 0);
+            buffered -= extent.consumed;
         }
         debug_assert_eq!(index_offset, entry.node.index_end());
         let page = self.state.pending_metadata.as_mut().unwrap();
-        if compressor.placement == Placement::Inline {
-            page.write_at(index_offset, &compressor.data);
+        if let Some(tail) = compressor.inline_tail() {
+            page.write_at(index_offset, tail);
         }
         page.write_inode(&entry.node, self.state.nodes.len());
         let header = encode::inode(&entry.node, self.state.nodes.len());
@@ -321,12 +383,7 @@ impl<W: AsyncWrite + AsyncSeek> AsyncBuilder<W> {
 
     async fn prepare_metadata(&mut self, node: &Node) -> Result<()> {
         for page in self.state.prepare_metadata(node) {
-            write_at(
-                &mut self.output,
-                u64::from(page.block) * BLOCK_SIZE as u64,
-                &page.data,
-            )
-            .await?;
+            write_at(&mut self.output, page.offset(), page.bytes()).await?;
         }
         Ok(())
     }
@@ -347,12 +404,7 @@ impl<W: AsyncWrite + AsyncSeek> AsyncBuilder<W> {
 
     async fn flush_metadata(&mut self) -> Result<()> {
         if let Some(page) = self.state.pending_metadata.take() {
-            write_at(
-                &mut self.output,
-                u64::from(page.block) * BLOCK_SIZE as u64,
-                &page.data,
-            )
-            .await?;
+            write_at(&mut self.output, page.offset(), page.bytes()).await?;
         }
         Ok(())
     }

@@ -1288,46 +1288,125 @@ fn decode_lz4_prefix(mut input: &[u8], output: &mut [u8]) -> Result<()> {
 
 #[cfg(feature = "zstd")]
 fn decode_zstd(input: &[u8], output: &mut [u8], window_size: u32, partial: bool) -> Result<()> {
-    use ruzstd::{decoding::StreamingDecoder, io::Read};
+    use std::io::{self, Read};
+    use zrip::frame::{MAX_BLOCK_SIZE, header::parse_frame_header};
 
-    let mut decoder = StreamingDecoder::new_with_max_window_size(input, u64::from(window_size))
-        .map_err(|err| Error::CorruptedData(format!("invalid Zstd frame: {err}")))?;
-    // ruzstd exposes the content size but does not validate it or the reserved bit.
-    let descriptor = input[4]; // Successful frame initialization validated this byte.
-    if descriptor & 8 != 0
-        || (descriptor & 0xe0 != 0
-            && if partial {
-                decoder.decoder.content_size() < output.len() as u64
+    // zrip reads concatenated frames; expose exactly one, validating blocks lazily
+    // so an unreferenced suffix cannot invalidate a partial EROFS extent.
+    struct Frame<'a> {
+        input: &'a [u8],
+        remaining: usize,
+        block_limit: usize,
+        last: bool,
+        checksum: bool,
+    }
+
+    impl Read for Frame<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if output.is_empty() {
+                return Ok(0);
+            }
+            if self.remaining == 0 {
+                if self.last {
+                    if !self.checksum {
+                        return Ok(0);
+                    }
+                    self.remaining = 4;
+                    self.checksum = false;
+                } else {
+                    let bytes = self.input.get(..3).ok_or(io::ErrorKind::UnexpectedEof)?;
+                    let header = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
+                    let kind = (header >> 1) & 3;
+                    let size = (header >> 3) as usize;
+                    if kind == 3 || size > self.block_limit {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid Zstd block type or size",
+                        ));
+                    }
+                    self.remaining = 3 + if kind == 1 { 1 } else { size };
+                    self.last = header & 1 != 0;
+                }
+            }
+            let count = output.len().min(self.remaining).min(self.input.len());
+            if count == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            output[..count].copy_from_slice(&self.input[..count]);
+            self.input = &self.input[count..];
+            self.remaining -= count;
+            Ok(count)
+        }
+    }
+
+    // Validate the EROFS window before the decoder can allocate frame history.
+    let header = parse_frame_header(input)
+        .map_err(|err| Error::CorruptedData(format!("invalid Zstd header: {err}")))?;
+    if window_size < 1024 || header.window_size > u64::from(window_size) {
+        return Err(Error::CorruptedData("invalid Zstd window".to_string()));
+    }
+    if header.dict_id.is_some() {
+        return Err(Error::CorruptedData(
+            "unexpected Zstd dictionary".to_string(),
+        ));
+    }
+    if let Some(size) = header.frame_content_size
+        && (size >= u64::MAX - 1
+            || if partial {
+                size < output.len() as u64
             } else {
-                decoder.decoder.content_size() != output.len() as u64
+                size != output.len() as u64
             })
     {
         return Err(Error::CorruptedData(
-            "invalid Zstd frame descriptor or content size".to_string(),
+            "invalid Zstd content size".to_string(),
         ));
     }
-    decoder
-        .read_exact(output)
-        .map_err(|err| Error::CorruptedData(format!("invalid Zstd data: {err}")))?;
-    if !partial
-        && (decoder
-            .read(&mut [0])
-            .map_err(|err| Error::CorruptedData(format!("invalid Zstd end: {err}")))?
-            != 0
-            || !decoder.get_ref().is_empty()
-            || !decoder.decoder.is_finished())
-    {
+
+    let block_limit = (header.window_size as usize).min(MAX_BLOCK_SIZE);
+    let frame = Frame {
+        input,
+        remaining: header.header_size,
+        block_limit,
+        last: false,
+        checksum: header.content_checksum,
+    };
+    let limit = if partial { usize::MAX } else { output.len() };
+    let mut decoder = zrip::FrameDecoder::with_limit(frame, limit);
+    // shortcut: relies on zrip's one-block reads; revisit if its streaming API changes.
+    let mut block = vec![0; block_limit + 1];
+    let mut written = 0;
+    loop {
+        if partial && written == output.len() {
+            return Ok(());
+        }
+        let count = decoder
+            .read(&mut block)
+            .map_err(|err| Error::CorruptedData(format!("invalid Zstd data: {err}")))?;
+        if count == 0 {
+            break;
+        }
+        if count > block_limit {
+            return Err(Error::CorruptedData("oversized Zstd block".to_string()));
+        }
+        let copied = count.min(output.len() - written);
+        output[written..written + copied].copy_from_slice(&block[..copied]);
+        written += copied;
+        if !partial && copied != count {
+            return Err(Error::CorruptedData(
+                "Zstd output length mismatch".to_string(),
+            ));
+        }
+    }
+    if written != output.len() {
         return Err(Error::CorruptedData(
-            "Zstd length or stream end mismatch".to_string(),
+            "Zstd output length mismatch".to_string(),
         ));
     }
-    // The hash feature computes the checksum; callers must compare it themselves.
-    // ruzstd hashes bytes as they are collected, not when a block is decoded.
-    if decoder.decoder.can_collect() == 0
-        && let Some(checksum) = decoder.decoder.get_checksum_from_data()
-        && Some(checksum) != decoder.decoder.get_calculated_checksum()
-    {
-        return Err(Error::CorruptedData("Zstd checksum mismatch".to_string()));
+    if !decoder.into_inner().input.is_empty() {
+        return Err(Error::CorruptedData(
+            "Zstd frame length mismatch".to_string(),
+        ));
     }
     Ok(())
 }
