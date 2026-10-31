@@ -1,5 +1,6 @@
 use crate::source;
 use anyhow::Result;
+use bitflags::Flags;
 use chrono::{DateTime, Local};
 use clap::Args;
 use erofs_rs::{
@@ -31,90 +32,10 @@ pub struct DumpArgs {
 // Filesystem incompatible features:             chunked_file xattr_prefixes
 // Filesystem UUID:                              f980c99a-21e7-4bc2-9f37-cbf3f5cb69c9
 
-struct Feature {
-    flag: u32,
-    name: &'static str,
-}
-
-static COMPAT_FEATURES_LIST: &[Feature] = &[
-    Feature {
-        flag: 0x01,
-        name: "sb_csum",
-    },
-    Feature {
-        flag: 0x02,
-        name: "mtime",
-    },
-    Feature {
-        flag: 0x04,
-        name: "xattr_filter",
-    },
-    Feature {
-        flag: 0x08,
-        name: "shared_ea_in_metabox",
-    },
-    Feature {
-        flag: 0x10,
-        name: "plain_xattr_pfx",
-    },
-    Feature {
-        flag: 0x20,
-        name: "ishare_xattrs",
-    },
-];
-
-static INCOMPAT_FEATURES_LIST: &[Feature] = &[
-    Feature {
-        flag: 0x001,
-        name: "lz4_0padding",
-    },
-    Feature {
-        flag: 0x002,
-        name: "compr_cfgs",
-    },
-    Feature {
-        flag: 0x002,
-        name: "big_pcluster",
-    },
-    Feature {
-        flag: 0x004,
-        name: "chunked_file",
-    },
-    Feature {
-        flag: 0x008,
-        name: "device_table",
-    },
-    Feature {
-        flag: 0x010,
-        name: "ztailpacking",
-    },
-    Feature {
-        flag: 0x020,
-        name: "fragments",
-    },
-    Feature {
-        flag: 0x020,
-        name: "dedupe",
-    },
-    Feature {
-        flag: 0x040,
-        name: "xattr_prefixes",
-    },
-    Feature {
-        flag: 0x080,
-        name: "48bit",
-    },
-    Feature {
-        flag: 0x100,
-        name: "metabox",
-    },
-];
-
-fn feature_names(feature_bits: u32, feature_list: &[Feature]) -> Vec<&'static str> {
-    feature_list
+fn feature_names(flags: impl Flags) -> Vec<&'static str> {
+    flags
         .iter()
-        .filter(|feature| feature.flag & feature_bits == feature.flag)
-        .map(|feature| feature.name)
+        .flat_map(|flag| flag.iter_equal_names())
         .collect()
 }
 
@@ -198,11 +119,11 @@ pub async fn dump(args: DumpArgs) -> Result<()> {
     println!("Filesystem created:                           {}", created);
     println!(
         "Filesystem compatible features:               {}",
-        feature_names(block.feature_compat, COMPAT_FEATURES_LIST).join(" ")
+        feature_names(block.feature_compat_flags()).join(" ")
     );
     println!(
         "Filesystem incompatible features:             {}",
-        feature_names(block.feature_incompat, INCOMPAT_FEATURES_LIST).join(" ")
+        feature_names(block.feature_incompat_flags()).join(" ")
     );
 
     println!(
@@ -216,38 +137,34 @@ pub async fn dump(args: DumpArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use erofs_rs::types::{FeatureCompat, FeatureIncompat};
 
     #[test]
     fn zero_bits_yield_no_names() {
-        assert_eq!(
-            feature_names(0x00000000, COMPAT_FEATURES_LIST),
-            Vec::<&'static str>::new()
-        );
-        assert_eq!(
-            feature_names(0x00000000, INCOMPAT_FEATURES_LIST),
-            Vec::<&'static str>::new()
-        );
+        let flags = FeatureCompat::from_bits_retain(0x0);
+        assert_eq!(feature_names(flags), Vec::<&'static str>::new());
+        let flags = FeatureIncompat::from_bits_retain(0x0);
+        assert_eq!(feature_names(flags), Vec::<&'static str>::new());
     }
 
     #[test]
     fn aliased_bits_yield_every_name() {
-        let feature_bits = 0x022;
+        let flags = FeatureIncompat::from_bits_retain(0x022);
         let res = vec!["compr_cfgs", "big_pcluster", "fragments", "dedupe"];
-        assert_eq!(feature_names(feature_bits, INCOMPAT_FEATURES_LIST), res);
+        assert_eq!(feature_names(flags), res);
     }
 
     #[test]
     fn unknown_bits_ignored() {
-        assert_eq!(feature_names(0x142, COMPAT_FEATURES_LIST), vec!["mtime"]);
-        assert_eq!(
-            feature_names(0x300, INCOMPAT_FEATURES_LIST),
-            vec!["metabox"]
-        );
+        let flags = FeatureCompat::from_bits_retain(0x142);
+        assert_eq!(feature_names(flags), vec!["mtime"]);
+        let flags = FeatureIncompat::from_bits_retain(0x300);
+        assert_eq!(feature_names(flags), vec!["metabox"]);
     }
 
     #[test]
     fn names_follow_order() {
-        let feature_bits = 0x3f;
+        let flags = FeatureCompat::from_bits_retain(0x3f);
         let res = vec![
             "sb_csum",
             "mtime",
@@ -256,8 +173,8 @@ mod tests {
             "plain_xattr_pfx",
             "ishare_xattrs",
         ];
-        assert_eq!(feature_names(feature_bits, COMPAT_FEATURES_LIST), res);
-        let feature_bits = 0x1ff;
+        assert_eq!(feature_names(flags), res);
+        let flags = FeatureIncompat::from_bits_retain(0x1ff);
         let res = vec![
             "lz4_0padding",
             "compr_cfgs",
@@ -271,6 +188,6 @@ mod tests {
             "48bit",
             "metabox",
         ];
-        assert_eq!(feature_names(feature_bits, INCOMPAT_FEATURES_LIST), res);
+        assert_eq!(feature_names(flags), res);
     }
 }
